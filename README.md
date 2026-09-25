@@ -82,12 +82,16 @@ max crush 736 vs 800 mm at 78 vs 84 ms, restitution 0.17 vs 0.10–0.13
 
 ![Neon pulse](docs/neon_pulse.png)
 
-Nose-to-nose Neon vs Neon at 35 mph (`headon neon neon`) gives Δv 17.2 m/s
-each with e ≈ 0.10 — the symmetric case is the barrier test, whose measured
-Δv is 17.65 m/s. Two `neon-pulse` vehicles against each other are a known
-weak spot: two fine, light honeycomb fronts mangle each other's interface
-under node-to-face contact (mass scaling then adds 20–30 % mass); pair the
-pulse vehicle with a coarse one, or with the wall.
+The pulse vehicle carries a thin stiff elastic **bumper layer** (`bumper =
+[0.1 m, 25 kg, 300 MPa]`, part `<name>_bumper`) ahead of the honeycomb: it
+spreads nodal contact loads like a bumper beam, so two soft fronts meet as
+two stiff faces. Without it two `neon-pulse` fronts dimple and interlock
+each other under node-to-face contact. Nose-to-nose `headon neon-pulse
+neon-pulse 35 35` gives Δv 17.5 m/s each, 34 g, 745 mm crush, e = 0.12 (the
+symmetric case is the barrier test: measured Δv 17.65 m/s), and 45 vs
+25 mph gives the same Δv, as it must.
+
+![Neon vs Neon](docs/neon_pulse_headon.gif)
 
 What a homogenised block cannot do: the real car decelerates the cabin
 within 3 ms through stiff rails while the engine mass is still free; the

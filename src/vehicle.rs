@@ -110,6 +110,11 @@ pub struct Vehicle {
     /// `Plasticity::transverse_factor`): sideways the front is this many
     /// times stronger than along the crush axis.
     pub transverse_factor: f64,
+    /// Stiff elastic bumper layer at the front of the crush zone
+    /// `[thickness m, mass kg, modulus Pa]` (part `<name>_bumper`): spreads
+    /// nodal contact loads into the honeycomb like a bumper beam, so two
+    /// soft fronts meet as two stiff faces. Only with a crush zone.
+    pub bumper: Option<[f64; 3]>,
     /// Mass of the crush-zone material (kg); the rest of the vehicle mass
     /// sits in the body block. `None` = uniform density. A light crush
     /// zone carries the plastic wave faster (√(H/ρ)), like real rails
@@ -147,7 +152,7 @@ impl Vehicle {
             modulus,
             body_modulus: modulus,
             side_curve: None,
-            side_modulus: None, force_table: None, crush_element_size: None, compaction_map: None, crush_zone_mass: None, transverse_factor: Vehicle::TRANSVERSE_FACTOR,
+            side_modulus: None, force_table: None, crush_element_size: None, compaction_map: None, crush_zone_mass: None, bumper: None, transverse_factor: Vehicle::TRANSVERSE_FACTOR,
         }
     }
 
@@ -173,7 +178,7 @@ impl Vehicle {
             modulus: self.side_modulus.unwrap_or(self.modulus),
             body_modulus: self.side_modulus.unwrap_or(self.modulus),
             side_curve: None,
-            side_modulus: None, force_table: None, crush_element_size: None, compaction_map: None, crush_zone_mass: None, transverse_factor: Vehicle::TRANSVERSE_FACTOR,
+            side_modulus: None, force_table: None, crush_element_size: None, compaction_map: None, crush_zone_mass: None, bumper: None, transverse_factor: Vehicle::TRANSVERSE_FACTOR,
         }
     }
 
@@ -191,6 +196,16 @@ impl Vehicle {
         format!("{}_crush", self.name)
     }
 
+    /// Part name of the bumper layer when `bumper` is set.
+    pub fn bumper_part_name(&self) -> String {
+        format!("{}_bumper", self.name)
+    }
+
+    /// Length of the honeycomb crush zone proper (crush zone minus bumper).
+    pub fn honeycomb_length(&self) -> f64 {
+        self.crush_zone_length - self.bumper.map_or(0.0, |b| b[0])
+    }
+
     /// Contact penalty stiffness per front-face node (N/m): the axial
     /// stiffness of the material behind the node, `E·A_node/h`, so the
     /// penalty is neither softer than the structure (spurious restitution
@@ -198,6 +213,9 @@ impl Vehicle {
     /// loads crush single elements flat. `n_face` is the number of nodes on
     /// the front face, `h` the block element size.
     pub fn contact_stiffness_per_node(&self, n_face: usize, h: f64) -> f64 {
+        // With a bumper the penalty is still that of the honeycomb behind it:
+        // the plate only spreads the load, it must not make the contact
+        // itself stiff enough to fold the plate on impact.
         let h_front = if self.has_crush_zone() { self.crush_element_size.unwrap_or(h) } else { h };
         self.modulus * self.frontal_area() / (n_face as f64 * h_front)
     }
@@ -220,7 +238,7 @@ impl Vehicle {
     /// Density of the crush-zone material.
     pub fn crush_density(&self) -> f64 {
         match self.crush_zone_mass {
-            Some(m) if self.has_crush_zone() => m / (self.crush_zone_length * self.frontal_area()),
+            Some(m) if self.has_crush_zone() => (m - self.bumper.map_or(0.0, |b| b[1])) / (self.honeycomb_length() * self.frontal_area()),
             _ => self.density(),
         }
     }
@@ -248,7 +266,7 @@ impl Vehicle {
             Some(table) => {
                 let curve = match &self.compaction_map {
                     Some(cm) if cm.len() == table.len() => table.iter().zip(cm).map(|([_, f], c)| [*c, f / a]).collect(),
-                    _ => Self::yield_curve(table, self.crush_zone_length, a),
+                    _ => Self::yield_curve(table, self.honeycomb_length(), a),
                 };
                 Material::honeycomb_curve(self.modulus, self.crush_density(), curve, Some([Self::LOCK_COMPACTION, Self::LOCK_SLOPE_FACTOR * self.modulus]))
             }
@@ -303,6 +321,7 @@ impl Vehicle {
         v.crush_zone_length = 1.5;
         v.crush_element_size = Some(0.1);
         v.crush_zone_mass = Some(190.0);
+        v.bumper = Some([0.1, 25.0, 3.0e8]);
         v.modulus = 4e6;
         v.body_modulus = 2.7e8;
         let knots = [0.0, 0.1165, 0.2330, 0.3496, 0.4661, 0.5826, 0.6991];
@@ -375,23 +394,35 @@ pub fn add_vehicle(mesh: &mut Mesh, v: &Vehicle, front_x: f64, y_center: f64, z_
     }
     // Body block (part `<name>`) and crush-zone block (part `<name>_crush`)
     // with matching y/z grids, merged at their shared face.
-    let l_c = v.crush_zone_length;
-    let l_b = v.size[0] - l_c;
+    let t_b = v.bumper.map_or(0.0, |b| b[0]);
+    let l_c = v.crush_zone_length - t_b;
+    let l_b = v.size[0] - v.crush_zone_length;
     let ny = (v.size[1] / element_size).round().max(1.0) as usize;
     let nz = (v.size[2] / element_size).round().max(1.0) as usize;
     let nxb = (l_b / element_size).round().max(1.0) as usize;
     let nxc = (l_c / v.crush_element_size.unwrap_or(element_size)).round().max(1.0) as usize;
-    let (body_x0, crush_x0) = match heading {
-        Heading::PlusX => (x0, x0 + l_b),
-        Heading::MinusX => (x0 + l_c, x0),
+    // Blocks from rear to front along the heading.
+    let (body_x0, crush_x0, bumper_x0) = match heading {
+        Heading::PlusX => (x0, x0 + l_b, x0 + l_b + l_c),
+        Heading::MinusX => (x0 + l_c + t_b, x0 + t_b, x0),
     };
     let part = mesh.add_hex_block_n(&v.name, [body_x0, origin[1], origin[2]], [l_b, v.size[1], v.size[2]], [nxb, ny, nz], &[]);
     let crush_name = v.crush_part_name();
-    mesh.add_hex_block_n(&crush_name, [crush_x0, origin[1], origin[2]], [l_c, v.size[1], v.size[2]], [nxc, ny, nz], &[(face, &front)]);
+    let mut names = vec![crush_name.clone()];
+    if t_b > 0.0 {
+        mesh.add_hex_block_n(&crush_name, [crush_x0, origin[1], origin[2]], [l_c, v.size[1], v.size[2]], [nxc, ny, nz], &[]);
+        let bumper_name = v.bumper_part_name();
+        mesh.add_hex_block_n(&bumper_name, [bumper_x0, origin[1], origin[2]], [t_b, v.size[1], v.size[2]], [1, ny, nz], &[(face, &front)]);
+        names.push(bumper_name);
+    } else {
+        mesh.add_hex_block_n(&crush_name, [crush_x0, origin[1], origin[2]], [l_c, v.size[1], v.size[2]], [nxc, ny, nz], &[(face, &front)]);
+    }
     mesh.merge_coincident_nodes(1e-6 * element_size);
-    // Node set `<name>` spans both parts (initial velocity, delta-v).
+    // Node set `<name>` spans all parts (initial velocity, delta-v).
     let mut all = mesh.node_sets[&v.name].clone();
-    all.extend(mesh.node_sets[&crush_name].iter().copied());
+    for n in &names {
+        all.extend(mesh.node_sets[n].iter().copied());
+    }
     all.sort_unstable();
     all.dedup();
     mesh.node_sets.insert(v.name.clone(), all);
@@ -406,6 +437,9 @@ pub fn assign_vehicle(model: &mut Model, v: &Vehicle, heading: Heading, speed: f
     if v.has_crush_zone() && model.mesh.part_index(&v.crush_part_name()).is_some() {
         model.set_material(&v.name, v.body_material());
         model.set_material(&v.crush_part_name(), v.crush_material());
+        if let (Some(b), Some(_)) = (v.bumper, model.mesh.part_index(&v.bumper_part_name())) {
+            model.set_material(&v.bumper_part_name(), Material::elastic(b[2], 0.3, b[1] / (b[0] * v.frontal_area())));
+        }
     } else {
         model.set_material(&v.name, v.crush_material());
     }
@@ -492,7 +526,7 @@ pub fn barrier_metrics(model: &Model, results: &Results, part: &str, axis: usize
 pub fn barrier_metrics_window(model: &Model, results: &Results, part: &str, axis: usize, window: (f64, f64)) -> BarrierMetrics {
     let p = model.mesh.part_index(part).unwrap_or_else(|| panic!("no part '{}'", part));
     // A vehicle built with a crush zone is two parts: combine them.
-    let parts: Vec<usize> = [Some(p), model.mesh.part_index(&format!("{}_crush", part))].into_iter().flatten().collect();
+    let parts: Vec<usize> = [Some(p), model.mesh.part_index(&format!("{}_crush", part)), model.mesh.part_index(&format!("{}_bumper", part))].into_iter().flatten().collect();
     let series: Vec<(f64, f64, f64, f64)> = results
         .history
         .iter()
