@@ -53,6 +53,9 @@ enum Cmd {
         /// Override the crush-zone mass (kg).
         #[arg(long)]
         crush_mass: Option<f64>,
+        /// Override the transverse cap factor of the crush material.
+        #[arg(long)]
+        transverse: Option<f64>,
         #[command(flatten)]
         out: Out,
     },
@@ -62,6 +65,20 @@ enum Cmd {
         truck_mph: f64,
         #[arg(default_value_t = 30.0)]
         car_mph: f64,
+        #[command(flatten)]
+        out: Out,
+    },
+    /// Head-on between any two vehicles (neon | neon-pulse | silverado | *-raw).
+    Headon {
+        vehicle_a: String,
+        vehicle_b: String,
+        #[arg(default_value_t = 35.0)]
+        mph_a: f64,
+        #[arg(default_value_t = 35.0)]
+        mph_b: f64,
+        /// Lateral offset of vehicle B (m): 0 = full overlap.
+        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+        offset: f64,
         #[command(flatten)]
         out: Out,
     },
@@ -94,6 +111,9 @@ struct Out {
     /// Sample the history every N steps.
     #[arg(long, default_value_t = 1)]
     history_steps: usize,
+    /// Safety factor on the stable time step.
+    #[arg(long)]
+    dt_scale: Option<f64>,
 }
 
 impl Out {
@@ -104,6 +124,9 @@ impl Out {
         }
         if self.history.is_some() {
             model.settings.history_steps = self.history_steps.max(1);
+        }
+        if let Some(f) = self.dt_scale {
+            model.settings.dt_scale = f;
         }
     }
 }
@@ -135,17 +158,31 @@ fn part_delta_v(model: &Model, results: &Results, part: &str) -> (f64, [f64; 3],
     (m, [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]], v1)
 }
 
-/// Crush along x of a part: original length minus current front-to-rear distance.
-fn crush_x(model: &Model, results: &Results, part: &str, front_set: &str, len0: f64) -> f64 {
-    let x_now = |n: usize| model.mesh.nodes[n][0] + results.displacement[n][0];
+fn vehicle_by_name(name: &str) -> Vehicle {
+    match name {
+        "silverado" => Vehicle::chevrolet_silverado_2007_tuned(),
+        "silverado-raw" => Vehicle::chevrolet_silverado_2007(),
+        "neon" => Vehicle::dodge_neon_1996_tuned(),
+        "neon-raw" => Vehicle::dodge_neon_1996(),
+        "neon-pulse" => Vehicle::dodge_neon_1996_pulse(),
+        other => panic!("unknown vehicle '{}' (neon | neon-raw | neon-pulse | silverado | silverado-raw)", other),
+    }
+}
+
+/// Dynamic crush as an accelerometer (rear-seat) node's x displacement
+/// relative to the mean of the front face: what an NHTSA rear-seat
+/// accelerometer integrates to.
+fn crush_rear(model: &Model, results: &Results, accelerometer: &str, front_set: &str) -> f64 {
+    let acc = model.accelerometers.iter().find(|a| a.name == accelerometer).expect("accelerometer");
+    let node = acc.nodes[0];
     let front = model.mesh.face_set_nodes(front_set).unwrap();
-    let body = model.mesh.nodes_of(part).unwrap();
-    let front_x0 = model.mesh.nodes[front[0]][0];
-    let (xmin, xmax) = body.iter().map(|n| model.mesh.nodes[*n][0]).fold((f64::MAX, f64::MIN), |(a, b), x| (a.min(x), b.max(x)));
-    let rear_x0 = if (front_x0 - xmin).abs() < 1e-9 { xmax } else { xmin };
-    let mean = |ids: &[usize]| ids.iter().map(|n| x_now(*n)).sum::<f64>() / ids.len() as f64;
-    let rear: Vec<usize> = body.iter().copied().filter(|n| (model.mesh.nodes[*n][0] - rear_x0).abs() < 1e-9).collect();
-    len0 - (mean(&front) - mean(&rear)).abs()
+    let front_u = front.iter().map(|n| results.displacement[*n][0]).sum::<f64>() / front.len() as f64;
+    (results.displacement[node][0] - front_u).abs()
+}
+
+/// CFC 60 peak magnitude of an accelerometer's local-x pulse (g), or None.
+fn peak_g(model: &Model, results: &Results, accelerometer: &str) -> Option<f64> {
+    crushrs::signal::Pulse::from_history(model, results, accelerometer, crushrs::vehicle::PULSE_DT).ok().map(|p| p.filtered(60.0).accel.iter().map(|a| a.abs()).fold(0.0, f64::max) / 9.81)
 }
 
 fn main() {
@@ -171,7 +208,7 @@ fn main() {
             }
             outputs(&model, &results, &out, None);
         }
-        Cmd::Barrier { vehicle, element_size, calibrate: cal, pulse, modulus, body_modulus, crush_zone, crush_mass, out } => {
+        Cmd::Barrier { vehicle, element_size, calibrate: cal, pulse, modulus, body_modulus, crush_zone, crush_mass, transverse, out } => {
             if let Some(pulse_file) = pulse {
                 let mut v = match vehicle.as_str() {
                     "silverado" => Vehicle::chevrolet_silverado_2007_tuned(),
@@ -192,6 +229,9 @@ fn main() {
                 }
                 if let Some(m) = crush_mass {
                     v.crush_zone_mass = Some(m);
+                }
+                if let Some(t) = transverse {
+                    v.transverse_factor = t;
                 }
                 let speed = 35.0 * MPH;
                 let measured = crushrs::signal::Pulse::read_nhtsa_tsv(Path::new(&pulse_file), true).unwrap_or_else(|e| panic!("{}", e));
@@ -287,8 +327,8 @@ fn main() {
             let mut model = Model::new(mesh);
             assign_vehicle(&mut model, &truck, Heading::PlusX, truck_mph * MPH);
             assign_vehicle(&mut model, &car, Heading::MinusX, car_mph * MPH);
-            let n_face = model.mesh.face_set_nodes("neon_front").unwrap().len() as f64;
-            model.add_contact_pair("silverado_front", "neon_front", 400.0 * car.curve.stiffness / n_face, 0.3);
+            let n_face = model.mesh.face_set_nodes("neon_front").unwrap().len();
+            model.add_contact_pair("silverado_front", "neon_front", car.contact_stiffness_per_node(n_face, h).min(truck.contact_stiffness_per_node(n_face, h)), 0.3);
             model.settings.end_time = 0.15;
             add_vehicle_accelerometer(&mut model, "silverado", "silverado_front");
             add_vehicle_accelerometer(&mut model, "neon", "neon_front");
@@ -300,10 +340,44 @@ fn main() {
             let v_common = (mt * v_t0 + mc * v_c0) / (mt + mc);
             println!("2007 Silverado {:.0} kg @ {:+.0} mph  vs  1996 Neon {:.0} kg @ {:+.0} mph", mt, truck_mph, mc, -car_mph);
             println!("{} elements, {} steps, {:.2?} (forces {:.2?}, contact {:.2?})", model.mesh.hexes.len(), results.steps, results.wall_time, results.force_time, results.contact_time);
-            println!("               delta-v              crush   (perfectly plastic limit)");
-            println!("Silverado  {:+7.2} m/s {:+6.1} mph   {:4.0} mm   ({:+.2} m/s)", dvt[0], dvt[0] / MPH, crush_x(&model, &results, "silverado", "silverado_front", truck.size[0]) * 1e3, v_common - v_t0);
-            println!("Neon       {:+7.2} m/s {:+6.1} mph   {:4.0} mm   ({:+.2} m/s)", dvc[0], dvc[0] / MPH, crush_x(&model, &results, "neon", "neon_front", car.size[0]) * 1e3, v_common - v_c0);
+            println!("               delta-v         rear-seat crush   (perfectly plastic limit)");
+            println!("Silverado  {:+7.2} m/s {:+6.1} mph   {:4.0} mm   ({:+.2} m/s)", dvt[0], dvt[0] / MPH, crush_rear(&model, &results, "silverado_rear", "silverado_front") * 1e3, v_common - v_t0);
+            println!("Neon       {:+7.2} m/s {:+6.1} mph   {:4.0} mm   ({:+.2} m/s)", dvc[0], dvc[0] / MPH, crush_rear(&model, &results, "neon_rear", "neon_front") * 1e3, v_common - v_c0);
             println!("restitution e = {:.3};  momentum {:.0} -> {:.0} kg·m/s", (vc[0] - vt[0]) / (v_t0 - v_c0), mt * v_t0 + mc * v_c0, mt * vt[0] + mc * vc[0]);
+            outputs(&model, &results, &out, None);
+        }
+        Cmd::Headon { vehicle_a, vehicle_b, mph_a, mph_b, offset, out } => {
+            let mut a = vehicle_by_name(&vehicle_a);
+            let mut b = vehicle_by_name(&vehicle_b);
+            a.name = format!("{}_a", a.name);
+            b.name = format!("{}_b", b.name);
+            let h = Vehicle::TUNED_ELEMENT_SIZE;
+            let gap = 0.005;
+            let mut mesh = Mesh::new();
+            add_vehicle(&mut mesh, &a, -gap, 0.0, 0.0, Heading::PlusX, h);
+            add_vehicle(&mut mesh, &b, gap, offset, 0.0, Heading::MinusX, h);
+            let mut model = Model::new(mesh);
+            assign_vehicle(&mut model, &a, Heading::PlusX, mph_a * MPH);
+            assign_vehicle(&mut model, &b, Heading::MinusX, mph_b * MPH);
+            let (fa, fb) = (format!("{}_front", a.name), format!("{}_front", b.name));
+            let n_face = model.mesh.face_set_nodes(&fa).unwrap().len().min(model.mesh.face_set_nodes(&fb).unwrap().len());
+            model.add_contact_pair(&fa, &fb, a.contact_stiffness_per_node(n_face, h).min(b.contact_stiffness_per_node(n_face, h)), 0.3);
+            model.settings.end_time = 0.15;
+            let acc_a = add_vehicle_accelerometer(&mut model, &a.name, &fa);
+            let acc_b = add_vehicle_accelerometer(&mut model, &b.name, &fb);
+            model.settings.history_steps = 1;
+            out.configure(&mut model);
+            let results = crushrs::run(&model);
+            let (ma, dva, va) = part_delta_v(&model, &results, &a.name);
+            let (mb, dvb, vb) = part_delta_v(&model, &results, &b.name);
+            let (v_a0, v_b0) = (mph_a * MPH, -mph_b * MPH);
+            let v_common = (ma * v_a0 + mb * v_b0) / (ma + mb);
+            println!("{} {:.0} kg @ {:+.0} mph  vs  {} {:.0} kg @ {:+.0} mph", a.name, ma, mph_a, b.name, mb, -mph_b);
+            println!("{} elements, {} steps, {:.2?} (forces {:.2?}, contact {:.2?})", model.mesh.hexes.len(), results.steps, results.wall_time, results.force_time, results.contact_time);
+            println!("                 delta-v         rear-seat crush  peak (CFC60)  (perfectly plastic limit)");
+            println!("{:<12} {:+7.2} m/s {:+6.1} mph   {:4.0} mm   {:6.1} g      ({:+.2} m/s)", a.name, dva[0], dva[0] / MPH, crush_rear(&model, &results, &acc_a, &fa) * 1e3, peak_g(&model, &results, &acc_a).unwrap_or(f64::NAN), v_common - v_a0);
+            println!("{:<12} {:+7.2} m/s {:+6.1} mph   {:4.0} mm   {:6.1} g      ({:+.2} m/s)", b.name, dvb[0], dvb[0] / MPH, crush_rear(&model, &results, &acc_b, &fb) * 1e3, peak_g(&model, &results, &acc_b).unwrap_or(f64::NAN), v_common - v_b0);
+            println!("restitution e = {:.3};  momentum {:.0} -> {:.0} kg·m/s", (vb[0] - va[0]) / (v_a0 - v_b0), ma * v_a0 + mb * v_b0, ma * va[0] + mb * vb[0]);
             outputs(&model, &results, &out, None);
         }
         Cmd::Tbone { truck_mph, car_mph, offset, out } => {
@@ -320,8 +394,8 @@ fn main() {
             assign_vehicle(&mut model, &truck, Heading::PlusX, truck_mph * MPH);
             model.set_material(&side.name, side.crush_material());
             model.set_initial_velocity(&side.name, [0.0, car_mph * MPH, 0.0]);
-            let n_face = model.mesh.face_set_nodes("neon_side").unwrap().len() as f64;
-            model.add_contact_pair("silverado_front", "neon_side", 400.0 * side.curve.stiffness / n_face, 0.3);
+            let n_face = model.mesh.face_set_nodes("neon_side").unwrap().len();
+            model.add_contact_pair("silverado_front", "neon_side", side.contact_stiffness_per_node(n_face, h).min(truck.contact_stiffness_per_node(n_face, h)), 0.3);
             model.settings.end_time = 0.15;
             add_vehicle_accelerometer(&mut model, "silverado", "silverado_front");
             add_vehicle_accelerometer(&mut model, &side.name, "neon_side");

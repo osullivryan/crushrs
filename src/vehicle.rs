@@ -106,6 +106,10 @@ pub struct Vehicle {
     /// Compaction at each `force_table` knot (from [`calibrate_pulse`]);
     /// `None` = uniform crush of the crush zone, `c = −ln(1 − x/L_c)`.
     pub compaction_map: Option<Vec<f64>>,
+    /// Transverse cap factor of the crush material (see
+    /// `Plasticity::transverse_factor`): sideways the front is this many
+    /// times stronger than along the crush axis.
+    pub transverse_factor: f64,
     /// Mass of the crush-zone material (kg); the rest of the vehicle mass
     /// sits in the body block. `None` = uniform density. A light crush
     /// zone carries the plastic wave faster (√(H/ρ)), like real rails
@@ -143,7 +147,7 @@ impl Vehicle {
             modulus,
             body_modulus: modulus,
             side_curve: None,
-            side_modulus: None, force_table: None, crush_element_size: None, compaction_map: None, crush_zone_mass: None,
+            side_modulus: None, force_table: None, crush_element_size: None, compaction_map: None, crush_zone_mass: None, transverse_factor: Vehicle::TRANSVERSE_FACTOR,
         }
     }
 
@@ -169,7 +173,7 @@ impl Vehicle {
             modulus: self.side_modulus.unwrap_or(self.modulus),
             body_modulus: self.side_modulus.unwrap_or(self.modulus),
             side_curve: None,
-            side_modulus: None, force_table: None, crush_element_size: None, compaction_map: None, crush_zone_mass: None,
+            side_modulus: None, force_table: None, crush_element_size: None, compaction_map: None, crush_zone_mass: None, transverse_factor: Vehicle::TRANSVERSE_FACTOR,
         }
     }
 
@@ -185,6 +189,17 @@ impl Vehicle {
     /// Part name of the crush zone when [`has_crush_zone`](Self::has_crush_zone).
     pub fn crush_part_name(&self) -> String {
         format!("{}_crush", self.name)
+    }
+
+    /// Contact penalty stiffness per front-face node (N/m): the axial
+    /// stiffness of the material behind the node, `E·A_node/h`, so the
+    /// penalty is neither softer than the structure (spurious restitution
+    /// from energy parked in the springs) nor so stiff that nodal contact
+    /// loads crush single elements flat. `n_face` is the number of nodes on
+    /// the front face, `h` the block element size.
+    pub fn contact_stiffness_per_node(&self, n_face: usize, h: f64) -> f64 {
+        let h_front = if self.has_crush_zone() { self.crush_element_size.unwrap_or(h) } else { h };
+        self.modulus * self.frontal_area() / (n_face as f64 * h_front)
     }
 
     /// Stiffness scale for contact penalties (N/m).
@@ -220,6 +235,14 @@ impl Vehicle {
 
     /// Crush-zone material: honeycomb (rate form) with `σ_y = F_y/A`, `H = k·L_c/A`.
     pub fn crush_material(&self) -> Material {
+        let mut m = self.crush_material_axial();
+        if let Some(p) = m.plasticity.as_mut() {
+            p.transverse_factor = self.transverse_factor;
+        }
+        m
+    }
+
+    fn crush_material_axial(&self) -> Material {
         let a = self.frontal_area();
         match &self.force_table {
             Some(table) => {
@@ -233,10 +256,13 @@ impl Vehicle {
         }
     }
 
+    /// Default transverse cap factor of the crush material.
+    pub const TRANSVERSE_FACTOR: f64 = 4.0;
+
     /// Compaction at which a tabulated crush material locks up (≈ 75 %
     /// crushed); beyond it the yield stress rises with `LOCK_SLOPE_FACTOR·E`.
     pub const LOCK_COMPACTION: f64 = 1.4;
-    pub const LOCK_SLOPE_FACTOR: f64 = 0.3;
+    pub const LOCK_SLOPE_FACTOR: f64 = 1.0;
 
     /// Force–crush table → yield stress vs compaction, assuming the crush
     /// zone (length `l`) compacts uniformly: `c = −ln(1 − x/l)`, `σ = F/A`.
@@ -539,9 +565,9 @@ pub fn barrier_model(v: &Vehicle, element_size: f64, speed: f64, end_time: f64, 
     // Contact penalty per node: much stiffer than the crush stiffness shared
     // over the front-face nodes, so the penalty springs store ≲1 % of the
     // energy (otherwise they return it as spurious restitution).
-    let n_face = model.mesh.face_set_nodes(&format!("{}_front", v.name)).unwrap().len() as f64;
+    let n_face = model.mesh.face_set_nodes(&format!("{}_front", v.name)).unwrap().len();
     let front = format!("{}_front", v.name);
-    model.add_contact_pair(&front, "wall_face", 400.0 * v.contact_stiffness_reference() / n_face, 0.3);
+    model.add_contact_pair(&front, "wall_face", v.contact_stiffness_per_node(n_face, element_size), 0.3);
     model.settings.end_time = end_time;
     model.settings.history_steps = 2;
     model.settings.frame_steps = frame_steps;

@@ -97,6 +97,16 @@ pub struct Settings {
     /// Worker threads (0 = all available).
     #[serde(default)]
     pub threads: usize,
+    /// Selective mass scaling: elements whose stability limit falls below
+    /// this fraction of the initial stable step get mass added so the
+    /// step never drops further (0 = off). Crushed-flat honeycomb elements
+    /// otherwise collapse the time step.
+    #[serde(default = "default_mass_scaling")]
+    pub mass_scaling: f64,
+}
+
+fn default_mass_scaling() -> f64 {
+    0.25
 }
 
 fn default_dt_scale() -> f64 {
@@ -128,6 +138,7 @@ impl Default for Settings {
             history_steps: 0,
             simd: true,
             threads: 0,
+            mass_scaling: 0.25,
         }
     }
 }
@@ -217,12 +228,14 @@ impl Model {
         self
     }
 
-    /// Two-way contact between two face sets.
+    /// Two-way contact between two face sets: each side's nodes against the
+    /// other's faces, at half `stiffness` each so coincident nodes are not
+    /// double-counted (the surfaces see `stiffness` per node overall).
     pub fn add_contact_pair(&mut self, a: &str, b: &str, stiffness: f64, max_distance: f64) -> &mut Self {
         for (p, s) in [(a, b), (b, a)] {
             let nodes = self.mesh.face_set_nodes(p).unwrap_or_else(|| panic!("no face set '{}'", p));
             let faces = self.mesh.face_set(s).unwrap_or_else(|| panic!("no face set '{}'", s)).clone();
-            self.contacts.push(Contact { nodes, faces, stiffness, max_distance });
+            self.contacts.push(Contact { nodes, faces, stiffness: 0.5 * stiffness, max_distance });
         }
         self
     }

@@ -15,6 +15,7 @@ head-on crash takes about 0.2 s.
 ```bash
 cargo run --release -- crash 30 30 --gif crash.gif          # Silverado vs Neon head-on
 cargo run --release -- tbone 30 0 -1.2 --vtk out/tbone      # Silverado into the Neon's side
+cargo run --release -- headon neon neon 35 35 --history out/nn   # any two vehicles, optional --offset
 cargo run --release -- barrier neon                         # NCAP barrier test vs NHTSA KW400 targets
 cargo run --release -- barrier neon-pulse --pulse data/nhtsa/v02320tsv.078   # vs the measured NCAP pulse
 cargo run --release -- run examples/crash_impact.toml       # any TOML setup (writes out/crash.*.parquet)
@@ -39,7 +40,13 @@ Neon        +18.81 m/s  +42.1 mph   1093 mm   (+17.69 m/s)
   k_lock]` lock-up); only compression compacts. Isotropic crushable foam and
   J2 metal plasticity (finite-strain Hencky, reference models, scalar
   kernel); linear elastic.
-- **Contact:** node-to-face penalty on quad face sets, two-way pairs.
+- **Contact:** node-to-face penalty on quad face sets, two-way pairs (half
+  stiffness per side). Penalty per node = the axial stiffness of the
+  material behind it (`E·A_node/h`), limited to `0.1·m_node/dt²` (soft
+  constraint) and to a force of `m_node·10⁵ m/s²`; both diagonal splits of
+  a warped quad are tested with a wide edge tolerance. Fully crushed
+  elements are never eroded: selective mass scaling (`mass_scaling`, default
+  0.25 of the initial stable step) keeps the time step from collapsing.
 - **Explicit integration:** central difference, per-element stability
   limit `f(ν)·L/c_d` re-evaluated as elements crush; f32 lane kernel
   (`kernel_simd.rs`) with runtime AVX2 dispatch, scalar f64 reference kernel
@@ -74,6 +81,13 @@ max crush 736 vs 800 mm at 78 vs 84 ms, restitution 0.17 vs 0.10–0.13
 (rebound scatters ±0.3 m/s run to run: the lock-up front is chaotic).
 
 ![Neon pulse](docs/neon_pulse.png)
+
+Nose-to-nose Neon vs Neon at 35 mph (`headon neon neon`) gives Δv 17.2 m/s
+each with e ≈ 0.10 — the symmetric case is the barrier test, whose measured
+Δv is 17.65 m/s. Two `neon-pulse` vehicles against each other are a known
+weak spot: two fine, light honeycomb fronts mangle each other's interface
+under node-to-face contact (mass scaling then adds 20–30 % mass); pair the
+pulse vehicle with a coarse one, or with the wall.
 
 What a homogenised block cannot do: the real car decelerates the cabin
 within 3 ms through stiff rails while the engine mass is still free; the

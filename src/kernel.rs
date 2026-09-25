@@ -205,26 +205,56 @@ impl Elements {
 
     /// Explicit stability limit min(f(ν)·L/c_d) from the current geometry.
     pub fn stable_time_step(&self, u: &[f64]) -> Option<f64> {
-        let mut dt = f64::INFINITY;
-        for (e, conn) in self.conn.iter().enumerate() {
-            if self.eroded[e] {
-                continue;
-            }
-            let p: [Vector3<f64>; 8] = std::array::from_fn(|i| {
-                let n = conn[i] as usize;
-                Vector3::new(self.positions[n][0] + u[3 * n], self.positions[n][1] + u[3 * n + 1], self.positions[n][2] + u[3 * n + 2])
-            });
-            // dt = L / c₀ with the current characteristic length V/A_max.
-            // (Using the current density, c = c₀·√J, would allow
-            // L/√J — up to 2× larger for heavily crushed elements — but
-            // proved marginal for locked-up honeycomb, so the initial wave
-            // speed is kept: conservative for crushed elements.)
-            let (l, vol) = characteristic_length_and_volume(&p);
-            if l.is_finite() && vol > 0.0 {
-                dt = dt.min(l * self.dt_factor[e]);
+        let dt = self.element_time_steps(u).into_iter().fold(f64::INFINITY, f64::min);
+        dt.is_finite().then_some(dt)
+    }
+
+    /// Stability limit f(ν)·L/c_d of every element from the current
+    /// geometry (∞ for eroded or degenerate elements).
+    pub fn element_time_steps(&self, u: &[f64]) -> Vec<f64> {
+        self.conn
+            .iter()
+            .enumerate()
+            .map(|(e, conn)| {
+                if self.eroded[e] {
+                    return f64::INFINITY;
+                }
+                let p: [Vector3<f64>; 8] = std::array::from_fn(|i| {
+                    let n = conn[i] as usize;
+                    Vector3::new(self.positions[n][0] + u[3 * n], self.positions[n][1] + u[3 * n + 1], self.positions[n][2] + u[3 * n + 2])
+                });
+                // dt = L / c₀ with the current characteristic length V/A_max
+                // and the initial wave speed (conservative for crushed
+                // elements; the current-density form L/√J proved marginal).
+                let (l, vol) = characteristic_length_and_volume(&p);
+                if l.is_finite() && vol > 0.0 {
+                    l * self.dt_factor[e]
+                } else {
+                    f64::INFINITY
+                }
+            })
+            .collect()
+    }
+
+    /// Nodal mass to add so that no element's stability limit falls below
+    /// `dt_min` (selective mass scaling of crushed-flat elements). An
+    /// element needing a factor s² on its time step gets (s² − 1) of its
+    /// own mass added, spread over its nodes.
+    pub fn mass_scaling(&self, u: &[f64], dt_min: f64, element_mass: &[f64], added: &mut [f64]) -> f64 {
+        added.iter_mut().for_each(|m| *m = 0.0);
+        let mut total = 0.0;
+        for (e, dt) in self.element_time_steps(u).into_iter().enumerate() {
+            if dt < dt_min {
+                // Factor capped at 100 (10× on dt): beyond that the element
+                // is degenerate and no reasonable mass helps.
+                let extra = ((dt_min / dt).powi(2).min(100.0) - 1.0) * element_mass[e];
+                for &n in &self.conn[e] {
+                    added[n as usize] += extra / 8.0;
+                }
+                total += extra;
             }
         }
-        dt.is_finite().then_some(dt)
+        total
     }
 
     /// Pull SIMD states into `state` (for output).

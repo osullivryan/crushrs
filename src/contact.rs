@@ -10,6 +10,8 @@ pub struct ContactRuntime {
     faces: Vec<[usize; 4]>,
     stiffness: f64,
     max_distance: f64,
+    /// Penetration beyond which the penalty force stops growing.
+    depth_cap: f64,
     pub penetration_count: usize,
     pub max_penetration: f64,
 }
@@ -23,7 +25,11 @@ struct Face {
 }
 
 fn point_in_triangle(p: &Vector3<f64>, a: &Vector3<f64>, b: &Vector3<f64>, c: &Vector3<f64>) -> bool {
-    let tol = 1e-10;
+    // Generous edge tolerance (10 % of the triangle) so a node sitting on a
+    // shared edge, the diagonal of a warped quad, or wobbling just outside
+    // the surface's outer edge is never missed (faces are searched in order
+    // and the first hit is used, so overlaps do no harm).
+    let tol = 0.1;
     let v0 = c - a;
     let v1 = b - a;
     let v2 = p - a;
@@ -58,12 +64,32 @@ impl ContactRuntime {
                 p >= lo && p <= hi
             })
             .collect();
-        ContactRuntime { nodes, faces: c.faces.iter().map(|f| faces[*f]).collect(), stiffness: c.stiffness, max_distance: c.max_distance, penetration_count: 0, max_penetration: 0.0 }
+        ContactRuntime { nodes, faces: c.faces.iter().map(|f| faces[*f]).collect(), stiffness: c.stiffness, max_distance: c.max_distance, depth_cap: 0.1 * c.max_distance, penetration_count: 0, max_penetration: 0.0 }
     }
 
-    /// Add penalty forces for the current configuration `x = X + u`.
-    pub fn apply(&mut self, positions: &[[f64; 3]], u: &[f64], force: &mut [f64]) {
+    /// Maximum contact acceleration a node may receive (m/s²): bounds the
+    /// force on light (corner) nodes so a missed-then-caught penetration
+    /// cannot kick them at hundreds of m/s.
+    pub const MAX_ACCEL: f64 = 1.0e5;
+
+    /// Viscous damping ratio on the normal relative velocity of a
+    /// penetrating node (fraction of critical for the node's penalty
+    /// spring). Off by default: it dissipates energy at the interface that
+    /// should go into the structure (a 0.2 ratio raised the barrier KW400
+    /// by 6 %).
+    pub const DAMPING: f64 = 0.0;
+
+    /// Soft-constraint factor: a node's penalty stiffness is limited to
+    /// `SOFT · m_node / dt²` so light (corner) nodes get springs they can
+    /// ride stably instead of being kicked (LS-DYNA SOFT=1 style).
+    pub const SOFT: f64 = 0.1;
+
+    /// Add penalty forces for the current configuration `x = X + u` with
+    /// nodal velocities `v` (for the damping term); `dt` is the time step
+    /// the penalty must be stable at.
+    pub fn apply(&mut self, positions: &[[f64; 3]], u: &[f64], v: &[f64], masses: &[f64], dt: f64, force: &mut [f64]) {
         let cur = |n: usize| Vector3::new(positions[n][0] + u[3 * n], positions[n][1] + u[3 * n + 1], positions[n][2] + u[3 * n + 2]);
+        let vel = |n: usize| Vector3::new(v[3 * n], v[3 * n + 1], v[3 * n + 2]);
         let faces: Vec<Face> = self
             .faces
             .iter()
@@ -93,10 +119,28 @@ impl ContactRuntime {
                     continue;
                 }
                 let projected = point - face.normal * signed;
-                if !(point_in_triangle(&projected, &face.x[0], &face.x[1], &face.x[2]) || point_in_triangle(&projected, &face.x[0], &face.x[2], &face.x[3])) {
+                // Both diagonal splits of the (possibly warped) quad.
+                let inside = point_in_triangle(&projected, &face.x[0], &face.x[1], &face.x[2])
+                    || point_in_triangle(&projected, &face.x[0], &face.x[2], &face.x[3])
+                    || point_in_triangle(&projected, &face.x[1], &face.x[2], &face.x[3])
+                    || point_in_triangle(&projected, &face.x[1], &face.x[3], &face.x[0]);
+                if !inside {
                     continue;
                 }
-                let f = self.stiffness * (-signed) * face.normal;
+                // Penalty force, capped at the value for `depth_cap`
+                // penetration: a node that got deep (swept by a face while
+                // detection missed it) is pushed out steadily instead of
+                // being kicked at hundreds of m/s.
+                let depth = (-signed).min(self.depth_cap);
+                let k = self.stiffness.min(Self::SOFT * masses[n] / (dt * dt));
+                // Damping on the approach velocity (node into face), never
+                // pulling: keeps light nodes from chattering on the spring.
+                let fn_ = self.faces[fi];
+                let v_face = (vel(fn_[0]) + vel(fn_[1]) + vel(fn_[2]) + vel(fn_[3])) / 4.0;
+                let v_rel = face.normal.dot(&(vel(n) - v_face)); // > 0 = separating
+                let damping = 2.0 * Self::DAMPING * (k * masses[n]).sqrt() * (-v_rel).max(0.0);
+                let magnitude = (k * depth + damping).min(masses[n] * Self::MAX_ACCEL);
+                let f = magnitude * face.normal;
                 for d in 0..3 {
                     force[3 * n + d] += f[d];
                 }

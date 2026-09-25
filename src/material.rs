@@ -62,6 +62,19 @@ pub struct Plasticity {
     /// Uses one of the [`MAX_KNOTS`] knots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub densification: Option<[f64; 2]>,
+    /// Honeycomb only: the caps on the two transverse normal stresses (local
+    /// y, z of the corotational frame, which starts aligned with global) are
+    /// `transverse_factor · σ_y`. 1 = isotropic (default); a crash rail
+    /// structure is far stiffer sideways than along its crush axis.
+    #[serde(default = "one", skip_serializing_if = "is_one")]
+    pub transverse_factor: f64,
+}
+
+fn one() -> f64 {
+    1.0
+}
+fn is_one(x: &f64) -> bool {
+    *x == 1.0
 }
 
 impl Plasticity {
@@ -154,24 +167,24 @@ impl Material {
     }
 
     pub fn j2(youngs_modulus: f64, poisson_ratio: f64, density: f64, yield_stress: f64, hardening: f64) -> Self {
-        Material { youngs_modulus, poisson_ratio, density, plasticity: Some(Plasticity { yield_stress, hardening, model: PlasticModel::J2, curve: Vec::new(), densification: None }) }
+        Material { youngs_modulus, poisson_ratio, density, plasticity: Some(Plasticity { yield_stress, hardening, model: PlasticModel::J2, curve: Vec::new(), densification: None, transverse_factor: 1.0 }) }
     }
 
     /// Isotropic crushable foam (elastic Poisson ratio treated as 0).
     pub fn crushable_foam(youngs_modulus: f64, density: f64, yield_stress: f64, hardening: f64) -> Self {
-        Material { youngs_modulus, poisson_ratio: 0.0, density, plasticity: Some(Plasticity { yield_stress, hardening, model: PlasticModel::CrushableFoam, curve: Vec::new(), densification: None }) }
+        Material { youngs_modulus, poisson_ratio: 0.0, density, plasticity: Some(Plasticity { yield_stress, hardening, model: PlasticModel::CrushableFoam, curve: Vec::new(), densification: None, transverse_factor: 1.0 }) }
     }
 
     /// Crushable honeycomb, corotational rate form (the SIMD kernel model).
     pub fn honeycomb(youngs_modulus: f64, density: f64, yield_stress: f64, hardening: f64) -> Self {
-        Material { youngs_modulus, poisson_ratio: 0.0, density, plasticity: Some(Plasticity { yield_stress, hardening, model: PlasticModel::Honeycomb, curve: Vec::new(), densification: None }) }
+        Material { youngs_modulus, poisson_ratio: 0.0, density, plasticity: Some(Plasticity { yield_stress, hardening, model: PlasticModel::Honeycomb, curve: Vec::new(), densification: None, transverse_factor: 1.0 }) }
     }
 
     /// Crushable honeycomb with a tabulated yield stress vs compaction
     /// curve `[[c, σ_y], ...]` (see [`Plasticity::curve`]) and optional
     /// densification `[c_lock, k_lock]` (see [`Plasticity::densification`]).
     pub fn honeycomb_curve(youngs_modulus: f64, density: f64, curve: Vec<[f64; 2]>, densification: Option<[f64; 2]>) -> Self {
-        let p = Plasticity { yield_stress: curve[0][1], hardening: (curve[1][1] - curve[0][1]) / (curve[1][0] - curve[0][0]), model: PlasticModel::Honeycomb, curve, densification };
+        let p = Plasticity { yield_stress: curve[0][1], hardening: (curve[1][1] - curve[0][1]) / (curve[1][0] - curve[0][0]), model: PlasticModel::Honeycomb, curve, densification, transverse_factor: 1.0 };
         p.check().unwrap_or_else(|e| panic!("{}", e));
         Material { youngs_modulus, poisson_ratio: 0.0, density, plasticity: Some(p) }
     }
@@ -388,6 +401,8 @@ pub struct HoneycombParams {
     pub yield_stress: f64,
     pub hardening: f64,
     pub knots: [[f64; 3]; MAX_KNOTS],
+    /// Cap factor per normal component (local x, y, z).
+    pub cap_factor: [f64; 3],
 }
 
 impl HoneycombParams {
@@ -409,13 +424,13 @@ impl HoneycombParams {
             let last = knots[n - 1];
             knots[n] = [c_lock, last[1] + last[2] * (c_lock - last[0]), last[2] + k_lock];
         }
-        HoneycombParams { youngs_modulus: material.youngs_modulus, yield_stress: p.yield_stress, hardening: p.hardening, knots }
+        HoneycombParams { youngs_modulus: material.youngs_modulus, yield_stress: p.yield_stress, hardening: p.hardening, knots, cap_factor: [1.0, p.transverse_factor, p.transverse_factor] }
     }
 
     pub fn new(youngs_modulus: f64, yield_stress: f64, hardening: f64) -> Self {
         let mut knots = [[f64::INFINITY, 0.0, 0.0]; MAX_KNOTS];
         knots[0] = [0.0, yield_stress, hardening];
-        HoneycombParams { youngs_modulus, yield_stress, hardening, knots }
+        HoneycombParams { youngs_modulus, yield_stress, hardening, knots, cap_factor: [1.0; 3] }
     }
 
     /// Yield stress and local slope at compaction `c` (branch-free scan).
@@ -457,22 +472,24 @@ pub fn honeycomb_rate_update(prm: &HoneycombParams, f: &Matrix3<f64>, state: &Ra
     s[4] += e * de[(1, 2)];
     s[5] += e * de[(0, 2)];
 
-    // Cap the normal stresses with implicit hardening: for the active set A,
-    // Δc·E = Σ_A (|σ_i| − σ_y0 − H c − H Δc)  ⇒  Δc = Σ_A(|σ_i| − σ_yc) / (E + |A|·H).
+    // Cap the normal stresses (component k at t_k·σ_y) with implicit
+    // hardening: for the active set A,
+    // Δc·E = Σ_A (−σ_k − t_k(σ_yc + H Δc))  ⇒  Δc = Σ_A(−σ_k − t_k σ_yc) / (E + H Σ_A t_k).
     let (sigma_yc, hard) = p.yield_at(state.compaction);
+    let t = p.cap_factor;
     let mut dc = 0.0;
     for _ in 0..3 {
         let sigma_y = sigma_yc + hard * dc;
-        let (mut sum, mut n_active) = (0.0, 0usize);
+        let (mut sum, mut t_active) = (0.0, 0.0);
         for k in 0..3 {
             // Only compression compacts (and hardens); tension is just
-            // capped at +σ_y below.
-            if -s[k] > sigma_y {
-                sum += -s[k] - sigma_yc;
-                n_active += 1;
+            // capped below.
+            if -s[k] > t[k] * sigma_y {
+                sum += -s[k] - t[k] * sigma_yc;
+                t_active += t[k];
             }
         }
-        let dc_new = if n_active == 0 { 0.0 } else { sum / (e + n_active as f64 * hard) };
+        let dc_new = if t_active == 0.0 { 0.0 } else { sum / (e + t_active * hard) };
         if (dc_new - dc).abs() <= 1e-14 * dc_new.max(1e-300) {
             dc = dc_new;
             break;
@@ -481,7 +498,7 @@ pub fn honeycomb_rate_update(prm: &HoneycombParams, f: &Matrix3<f64>, state: &Ra
     }
     let sigma_y = (sigma_yc + hard * dc).max(0.0);
     for k in 0..3 {
-        s[k] = s[k].clamp(-sigma_y, sigma_y);
+        s[k] = s[k].clamp(-t[k] * sigma_y, t[k] * sigma_y);
     }
     let tau_y = 0.5 * sigma_y;
     for k in 3..6 {

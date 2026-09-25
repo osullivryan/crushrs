@@ -191,6 +191,8 @@ pub struct Block {
     pub youngs: V,
     pub yield0: V,
     pub hard: V,
+    /// Transverse cap factor (local y, z).
+    pub trans: V,
     /// Yield curve knots: compaction, stress, slope (unused knots at +inf).
     pub knot_c: [V; MAX_KNOTS],
     pub knot_s: [V; MAX_KNOTS],
@@ -216,6 +218,7 @@ impl Block {
             youngs: splat(1.0),
             yield0: splat(1.0),
             hard: ZERO,
+            trans: splat(1.0),
             knot_c: [splat(f32::INFINITY); MAX_KNOTS],
             knot_s: [ZERO; MAX_KNOTS],
             knot_h: [ZERO; MAX_KNOTS],
@@ -258,6 +261,7 @@ impl Block {
             }
         }
         self.youngs[l] = prm.youngs_modulus as f32;
+        self.trans[l] = prm.cap_factor[1] as f32;
         self.yield0[l] = prm.yield_stress as f32;
         self.hard[l] = prm.hardening as f32;
         for i in 0..MAX_KNOTS {
@@ -385,33 +389,36 @@ fn block_forces_impl(b: &mut Block, u: &[f64], positions: &[[f64; 3]], out: &mut
     let hard = kh;
     let sigma_yc = fma(hard, sub(b.compaction, kc), ks);
     // Caps with implicit hardening: 3 fixed passes of the active-set solve.
+    // Component caps t_k·σ_y: t = 1 along local x, `trans` for y, z.
+    let tk = [splat(1.0), b.trans, b.trans];
     let mut dc = ZERO;
     for _ in 0..3 {
         let sigma_y = fma(hard, dc, sigma_yc);
         let mut sum = ZERO;
-        let mut n_active = ZERO;
+        let mut t_active = ZERO;
         for k in 0..3 {
             // Only compression compacts (tension is just capped below).
             let a = scale(s[k], -1.0);
+            let cap = mul(tk[k], sigma_y);
             let mut over = [false; L];
             for l in 0..L {
-                over[l] = a[l] > sigma_y[l];
+                over[l] = a[l] > cap[l];
             }
-            sum = add(sum, select(over, sub(a, sigma_yc), ZERO));
-            n_active = add(n_active, select(over, splat(1.0), ZERO));
+            sum = add(sum, select(over, sub(a, mul(tk[k], sigma_yc)), ZERO));
+            t_active = add(t_active, select(over, tk[k], ZERO));
         }
-        let den = fma(n_active, hard, e);
+        let den = fma(t_active, hard, e);
         let dc_new = div(sum, den);
         let mut any = [false; L];
         for l in 0..L {
-            any[l] = n_active[l] > 0.0;
+            any[l] = t_active[l] > 0.0;
         }
         dc = select(any, dc_new, ZERO);
     }
     let sigma_y = max(fma(hard, dc, sigma_yc), ZERO);
-    let neg_sigma_y = scale(sigma_y, -1.0);
     for k in 0..3 {
-        s[k] = clamp(s[k], neg_sigma_y, sigma_y);
+        let cap = mul(tk[k], sigma_y);
+        s[k] = clamp(s[k], scale(cap, -1.0), cap);
     }
     let tau_y = scale(sigma_y, 0.5);
     let neg_tau_y = scale(tau_y, -1.0);
@@ -672,5 +679,8 @@ mod tests {
         assert!(close(m.plasticity.as_ref().unwrap().yield_at(1.5), prm.yield_at(1.5)));
         assert!(close(m.plasticity.as_ref().unwrap().yield_at(0.1), prm.yield_at(0.1)));
         check_lane_vs_scalar(&prm);
+        let mut prm_t = prm;
+        prm_t.cap_factor = [1.0, 4.0, 4.0];
+        check_lane_vs_scalar(&prm_t);
     }
 }

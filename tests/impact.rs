@@ -15,8 +15,8 @@ fn head_on(truck_mph: f64, car_mph: f64) -> (Model, crushrs::Results) {
     let mut model = Model::new(mesh);
     assign_vehicle(&mut model, &truck, Heading::PlusX, truck_mph * MPH);
     assign_vehicle(&mut model, &car, Heading::MinusX, car_mph * MPH);
-    let n_face = model.mesh.face_set_nodes("neon_front").unwrap().len() as f64;
-    model.add_contact_pair("silverado_front", "neon_front", 400.0 * car.curve.stiffness / n_face, 0.3);
+    let n_face = model.mesh.face_set_nodes("neon_front").unwrap().len();
+    model.add_contact_pair("silverado_front", "neon_front", car.contact_stiffness_per_node(n_face, Vehicle::TUNED_ELEMENT_SIZE), 0.3);
     model.settings.end_time = 0.15;
     let results = crushrs::run(&model);
     (model, results)
@@ -120,7 +120,7 @@ end_time = 0.15
         cy = model_api.materials[1].plasticity.as_ref().unwrap().yield_stress,
         ch = model_api.materials[1].plasticity.as_ref().unwrap().hardening,
         v = 30.0 * MPH,
-        k = model_api.contacts[0].stiffness,
+        k = 2.0 * model_api.contacts[0].stiffness, // a pair stores half per side
     );
     let cfg = Config::from_str(&toml).unwrap();
     let model = cfg.build(std::path::Path::new(".")).unwrap();

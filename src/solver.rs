@@ -196,15 +196,18 @@ pub fn run(model: &Model) -> Results {
 
     let mut elements = Elements::build(model, s.simd);
     let masses = model.lumped_masses(s.hourglass);
-    let mut mass_dof = vec![0.0; n];
+    let element_mass: Vec<f64> = (0..model.mesh.hexes.len()).map(|e| elements.volume[e] * model.materials[model.mesh.hex_part[e]].density).collect();
+    let mut added_mass = vec![0.0; n_nodes];
     let mut inv_mass = vec![0.0; n];
-    for i in 0..n_nodes {
-        for d in 0..3 {
-            mass_dof[3 * i + d] = masses[i];
-            inv_mass[3 * i + d] = if masses[i] > 0.0 { 1.0 / masses[i] } else { 0.0 };
+    let set_inv_mass = |inv_mass: &mut [f64], added: &[f64]| {
+        for i in 0..n_nodes {
+            let m = masses[i] + added[i];
+            for d in 0..3 {
+                inv_mass[3 * i + d] = if m > 0.0 { 1.0 / m } else { 0.0 };
+            }
         }
-    }
-    let _ = &mass_dof;
+    };
+    set_inv_mass(&mut inv_mass, &added_mass);
     let mut contacts: Vec<ContactRuntime> = model.contacts.iter().map(|c| ContactRuntime::new(c, &model.mesh.faces, &model.mesh.nodes)).collect();
     let fixed: Vec<usize> = model.fixed_nodes.iter().flat_map(|n| [3 * n, 3 * n + 1, 3 * n + 2]).collect();
 
@@ -220,6 +223,8 @@ pub fn run(model: &Model) -> Results {
         .fold(f64::INFINITY, f64::min);
     let stable = elements.stable_time_step(&u).unwrap_or_else(|| model.mesh.min_edge_length() / (3.0_f64.sqrt() * elements.material.iter().map(|m| m.dilatational_wave_speed()).fold(0.0, f64::max)));
     let stable = stable.min(contact_dt);
+    let dt_floor = if s.mass_scaling > 0.0 { s.mass_scaling * stable } else { 0.0 };
+    let mut added_mass_total = 0.0_f64;
     let mut dt = s.time_step.unwrap_or(stable * s.dt_scale);
     if contact_dt < stable * 1.0001 {
         debug!("time step limited by contact penalty stiffness: {:.3e} s", contact_dt);
@@ -249,7 +254,7 @@ pub fn run(model: &Model) -> Results {
     elements.compute_forces(&u, &mut f_int, threads);
     time_force += t0.elapsed();
     for c in &mut contacts {
-        c.apply(&model.mesh.nodes, &u, &mut f_ext);
+        c.apply(&model.mesh.nodes, &u, &v, &masses, dt, &mut f_ext);
     }
     for k in 0..n {
         acc[k] = (f_ext[k] - f_int[k]) * inv_mass[k];
@@ -282,7 +287,14 @@ pub fn run(model: &Model) -> Results {
     while t < s.end_time {
         if adaptive && step % s.adaptive_check_steps == 0 {
             if let Some(dt_stable) = elements.stable_time_step(&u) {
-                dt_cfl = s.dt_scale * dt_stable.min(contact_dt);
+                let mut dt_use = dt_stable;
+                if dt_floor > 0.0 && dt_stable < dt_floor {
+                    let total = elements.mass_scaling(&u, dt_floor, &element_mass, &mut added_mass);
+                    set_inv_mass(&mut inv_mass, &added_mass);
+                    added_mass_total = added_mass_total.max(total);
+                    dt_use = dt_floor;
+                }
+                dt_cfl = s.dt_scale * dt_use.min(contact_dt);
             }
         }
         dt = dt_cfl.min(s.end_time - t).max(1e-15);
@@ -294,7 +306,7 @@ pub fn run(model: &Model) -> Results {
         let tc = std::time::Instant::now();
         f_ext.fill(0.0);
         for c in &mut contacts {
-            c.apply(&model.mesh.nodes, &u, &mut f_ext);
+            c.apply(&model.mesh.nodes, &u, &v, &masses, dt, &mut f_ext);
         }
         time_contact += tc.elapsed();
 
@@ -354,6 +366,10 @@ pub fn run(model: &Model) -> Results {
     results.force_time = time_force;
     results.contact_time = time_contact;
     info!("{} steps in {:.2?} (forces {:.2?}, contact {:.2?}); {} elements eroded", step, results.wall_time, time_force, time_contact, eroded_total);
+    if added_mass_total > 0.0 {
+        let total_mass: f64 = masses.iter().sum();
+        info!("mass scaling added up to {:.3} kg ({:.3} % of {:.0} kg) to keep dt >= {:.2e} s", added_mass_total, 100.0 * added_mass_total / total_mass, total_mass, dt_floor);
+    }
     for (p, part) in model.mesh.parts.iter().enumerate() {
         let nodes = model.mesh.part_nodes(p);
         let (m, v1) = results.mean_velocity(&nodes);

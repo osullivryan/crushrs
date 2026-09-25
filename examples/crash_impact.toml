@@ -50,7 +50,7 @@ velocity = [-13.4112, 0.0, 0.0]
 [[contact]]
 a = "silverado_front"
 b = "neon_front"
-stiffness = 2.2e6
+stiffness = 4.4e6
 max_distance = 0.3
 
 [solver]
