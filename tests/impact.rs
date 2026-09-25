@@ -243,3 +243,68 @@ end_time = 0.001
     assert!((p.yield_at(2.0).0 - (30000.0 + 1.5 * 70000.0 + 0.6 * 7.0e6)).abs() < 1e-6);
     let _ = crushrs::run(&model);
 }
+
+#[test]
+fn rail_box_leaves_the_barrier_test_unchanged() {
+    use crushrs::vehicle::{barrier_model, run_barrier_pulse, RailBox};
+    // The rail box carries `force_fraction` of the force over its area and the
+    // skin the rest: modulus, yield and density scale together, so rail box
+    // and skin have the same wave speed and the same strain history
+    // against a flat wall. Check the split on the mesh, then the pulse.
+    let mut v = Vehicle::dodge_neon_1996_pulse();
+    v.rail_box = Some(RailBox { width: 1.0, z_range: [0.25, 0.8], force_fraction: 0.7 });
+    let model = barrier_model(&v, Vehicle::TUNED_ELEMENT_SIZE, 35.0 * MPH, 0.01, 0);
+    let rails = model.mesh.part_index(&v.rail_box_part_name()).expect("rail box part");
+    let skin = model.mesh.part_index(&v.crush_part_name()).unwrap();
+    let (n_rails, n_skin) = (model.mesh.part_hexes(rails).len() as f64, model.mesh.part_hexes(skin).len() as f64);
+    // 4 of 6 columns × 2 of 5 rows of the crush-zone cross-section.
+    assert!((n_rails / (n_rails + n_skin) - 8.0 / 30.0).abs() < 1e-9, "rail box area fraction {}", n_rails / (n_rails + n_skin));
+    let (mc, ms) = (&model.materials[rails], &model.materials[skin]);
+    let a = n_rails / (n_rails + n_skin);
+    let uniform = v.crush_material();
+    let force = |m: &crushrs::Material, area: f64| m.plasticity.as_ref().unwrap().curve[4][1] * area;
+    assert!((force(mc, a) + force(ms, 1.0 - a) - force(&uniform, 1.0)).abs() < 1e-6 * force(&uniform, 1.0), "force split");
+    assert!((mc.youngs_modulus / mc.density - ms.youngs_modulus / ms.density).abs() < 1e-9 * mc.youngs_modulus / mc.density, "wave speed");
+    assert!((mc.youngs_modulus * a + ms.youngs_modulus * (1.0 - a) - uniform.youngs_modulus).abs() < 1e-6 * uniform.youngs_modulus, "modulus split");
+
+    let speed = 35.0 * MPH;
+    let mut plain = v.clone();
+    plain.rail_box = None;
+    let (_, _, with) = run_barrier_pulse(&v, Vehicle::TUNED_ELEMENT_SIZE, speed, 0);
+    let (_, _, without) = run_barrier_pulse(&plain, Vehicle::TUNED_ELEMENT_SIZE, speed, 0);
+    let peak = |p: &crushrs::signal::Pulse| p.accel.iter().map(|a| a.abs()).fold(0.0, f64::max);
+    let dv = |p: &crushrs::signal::Pulse| p.velocity(speed).iter().cloned().fold(f64::INFINITY, f64::min);
+    // Peak and maximum velocity change within the run-to-run scatter of
+    // the lock-up front.
+    assert!((peak(&with) / peak(&without) - 1.0).abs() < 0.1, "peak {} vs {} g", peak(&with) / 9.81, peak(&without) / 9.81);
+    assert!((dv(&with) - dv(&without)).abs() < 0.5, "min velocity {} vs {}", dv(&with), dv(&without));
+}
+
+#[test]
+fn road_stops_the_underride_and_head_on_setup_is_repeatable() {
+    use crushrs::headon::HeadOn;
+    let mut a = Vehicle::lincoln_navigator_1999();
+    let mut b = Vehicle::dodge_neon_1996_pulse().with_mass(1378.0);
+    a.name = "navigator_a".into();
+    b.name = "neon_b".into();
+    let mut setup = HeadOn::new(30.14 * MPH, 30.14 * MPH);
+    setup.end_time = 0.15;
+    let (model, results, pa, pb) = setup.run(&a, &b);
+    assert!(model.mesh.part_index("ground").is_some());
+    // The Neon's front does not dive under the Navigator: in free space its
+    // crush zone left with −10 m/s downwards and the vehicles were still
+    // approaching at 150 ms (negative restitution).
+    let crush = model.mesh.part_index(&b.crush_part_name()).unwrap();
+    let nodes = model.mesh.part_nodes(crush);
+    let (_, v) = results.mean_velocity(&nodes);
+    assert!(v[2] > -3.0 && v[2] < 7.0, "Neon crush-zone vertical velocity {} m/s", v[2]);
+    let (_, va) = results.mean_velocity(&model.mesh.nodes_of(&a.name).unwrap());
+    let (_, vb) = results.mean_velocity(&model.mesh.nodes_of(&b.name).unwrap());
+    assert!(vb[0] > va[0], "vehicles still approaching at the end: {} vs {} m/s", va[0], vb[0]);
+    // Delta-v at 150 ms from the rear accelerometers: NHTSA test 4429 gives
+    // 9.9 (Navigator) and 19.6 m/s (Neon).
+    let dv_a = 30.14 * MPH - pa.velocity(30.14 * MPH).last().unwrap();
+    let dv_b = 30.14 * MPH - pb.velocity(30.14 * MPH).last().unwrap();
+    assert!((dv_a - 9.89).abs() < 1.0, "Navigator delta-v {}", dv_a);
+    assert!((dv_b - 19.57).abs() < 2.0, "Neon delta-v {}", dv_b);
+}

@@ -7,6 +7,7 @@
 
 pub mod contact;
 pub mod element;
+pub mod headon;
 pub mod input;
 pub mod kernel;
 pub mod kernel_simd;

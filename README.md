@@ -16,6 +16,9 @@ head-on crash takes about 0.2 s.
 cargo run --release -- crash 30 30 --gif crash.gif          # Silverado vs Neon head-on
 cargo run --release -- tbone 30 0 -1.2 --vtk out/tbone      # Silverado into the Neon's side
 cargo run --release -- headon neon neon 35 35 --history out/nn   # any two vehicles, optional --offset
+cargo run --release -- headon navigator neon-pulse 30.14 30.14 --mass-b 1378 \
+    --pulse-a data/nhtsa/v04429tsv.179,data/nhtsa/v04429tsv.182 \
+    --pulse-b data/nhtsa/v04429tsv.089,data/nhtsa/v04429tsv.092 [--calibrate-rail-boxes 12]   # vs a measured car-to-car test
 cargo run --release -- barrier neon                         # NCAP barrier test vs NHTSA KW400 targets
 cargo run --release -- barrier neon-pulse --pulse data/nhtsa/v02320tsv.078   # vs the measured NCAP pulse
 cargo run --release -- run examples/crash_impact.toml       # any TOML setup (writes out/crash.*.parquet)
@@ -56,7 +59,20 @@ Neon        +18.81 m/s  +42.1 mph   1093 mm   (+17.69 m/s)
   a bilinear force–crush curve; `calibrate` tunes the material so the
   *simulated* barrier test matches. Pre-tuned: 1996 Dodge Neon (front and
   side), 2007 Chevrolet Silverado (front). Element size 0.3 m; re-run
-  `barrier <vehicle>-raw --calibrate 14` for another size.
+  `barrier <vehicle>-raw --calibrate 14` for another size. Every vehicle
+  stands on a rigid **road** 0.15 m below its underbody (contact on the
+  `<name>_bottom` faces), in the barrier test and in impacts.
+- **Rail box** (`RailBox`, part `<name>_rails`): the frame rails and engine
+  carry most of the force, the fenders, hood and grille around them almost
+  none. A pulse vehicle's crush zone can carry a box (`width`, `z_range`,
+  `force_fraction`) whose elements take that fraction of the force–crush
+  curve over their own area and the skin the rest — modulus, yield and
+  density scaled alike, so both have the same wave speed and the same
+  strain history against a flat wall, and the barrier calibration is
+  untouched; the bumper plate over the box is stiffened the same way and
+  the contact penalty follows it node by node. A partner that overlaps
+  only part of the face sees the concentrated load. `calibrate_rail_boxes`
+  fits both vehicles' boxes to a measured car-to-car test (below).
 
 | Vehicle | Test mass | NHTSA KW400 | Simulated | Crush sim / target |
 |---|---|---|---|---|
@@ -87,39 +103,71 @@ The pulse vehicle carries a thin stiff elastic **bumper layer** (`bumper =
 spreads nodal contact loads like a bumper beam, so two soft fronts meet as
 two stiff faces. Without it two `neon-pulse` fronts dimple and interlock
 each other under node-to-face contact. Nose-to-nose `headon neon-pulse
-neon-pulse 35 35` gives Δv 17.5 m/s each, 34 g, 745 mm crush, e = 0.12 (the
-symmetric case is the barrier test: measured Δv 17.65 m/s), and 45 vs
-25 mph gives the same Δv, as it must.
+neon-pulse 35 35` gives Δv 16.8 m/s each, 34 g, 776 mm crush, e = 0.08 (the
+symmetric case is the barrier test: measured Δv 17.65 m/s, e = 0.17; with
+uniform faces, `--no-rail-box`, 17.5 m/s and e = 0.12 — the two rail boxes
+meeting pitch both cars a little, which costs rebound), and 45 vs 25 mph
+gives the same Δv, as it must.
 
 ![Neon vs Neon](docs/neon_pulse_headon.gif)
 
-### Blind validation: Navigator into Neon (NHTSA test 4429)
+### Validation: Navigator into Neon (NHTSA test 4429)
 
 `headon navigator neon-pulse 30.14 30.14 --mass-b 1378 --pulse-a
 data/nhtsa/v04429tsv.179,data/nhtsa/v04429tsv.182 --pulse-b
-data/nhtsa/v04429tsv.089,data/nhtsa/v04429tsv.092` predicts the real
-car-to-car test (2873 kg Navigator into the 1378 kg Neon, 30 mph each) from
-vehicles calibrated only on rigid-barrier tests — the Expedition/Navigator
-on test 3124 at the same speed, the Neon on test 2320 at a different speed.
+data/nhtsa/v04429tsv.089,data/nhtsa/v04429tsv.092` runs the real car-to-car
+test (2873 kg Navigator into the 1378 kg Neon, 30 mph each) with vehicles
+calibrated on rigid-barrier tests — the Expedition/Navigator on test 3124
+at the same speed, the Neon on test 2320 at a different speed — and
+compares the rear accelerometers.
 
 ![validation](docs/navigator_neon_validation.png)
 
-Through the main pulse (0–80 ms) it holds: Navigator velocity within
-0.3 m/s and peak −14 vs −16 g; Neon peak −32 vs −33 g but ~8 ms early. The
-late phase (80–110 ms) is under-predicted and the collision ends too soon:
-Δv 8.1 vs 9.9 m/s (Navigator) and 16.8 vs 19.6 m/s (Neon) at 150 ms. Two
-reasons, both visible in the mesh: the Navigator's front outside the Neon's
-silhouette (40 % of its face) never engages, whereas the real Navigator's
-rails and engine sit inside it — a homogenised face spreads stiffness
-uniformly; and the Neon is crushed 864 mm here, beyond the 736 mm its
-barrier test calibrated. The next step for mismatched pairs is a structural
-core box per face (rails/engine) inside a soft skin, which the barrier
-calibration cannot distinguish but the load-cell wall (AHOF) data can.
+|  | Navigator Δv at 150 ms | Neon Δv | peaks (CFC 60) | J |
+|---|---|---|---|---|
+| measured | 9.9 m/s | 19.6 m/s | −15.8 / −33.4 g | |
+| uniform faces, free in space (`--no-rail-box --no-ground`) | 8.1 | 16.8 | −14.2 / −31.8 | 6.20 |
+| uniform faces on the road (`--no-rail-box`), blind | 9.3 | 20.4 | −14.2 / −31.8 | 3.43 |
+| rail boxes on the road (default), fitted | 9.7 | 19.5 | −15.4 / −34.2 | 2.88 |
+
+`J` is the summed pulse objective (velocity RMS + end error + 0.1 × CFC 60
+RMS, m/s, for both cars). What was wrong before was not the faces: a free
+block has nothing to stop its nose from diving, so the taller Navigator's
+face tilted and pushed the Neon's front down at 10 m/s and under itself,
+and the collision "ended" with the two still approaching (e < 0). On the
+road the Neon bottoms out after its ground clearance and the whole late
+phase (80–150 ms) falls into place, with no fitting at all: the blind
+prediction is within 0.6 and 0.8 m/s of the measured Δv.
+
+The rail boxes are then fitted to this test with `--calibrate-rail-boxes
+12` (`headon.rs`): differential evolution over the eight box parameters
+(width, height band, force fraction per vehicle) on the summed pulse
+objective, ~160 impact runs, a global method because the box snaps to the
+element grid and the lock-up front is chaotic. It found the frame rails:
+the Navigator's box is 1.25 m wide at 0.15–0.72 m carrying 75 % of the
+force, the Neon's 0.45 m wide at 0.06–0.41 m carrying 80 % — both low in
+the face, where the average height of force of every measured vehicle
+lies. The search is bounded there on purpose: unconstrained, the fit was
+happy to put the Neon's stiffness in its cowl row (the SUV overriding it),
+which pitches the block nose-up against a barrier and is nothing a
+load-cell wall would ever show. With the boxes the barrier pulses stay
+matched (Neon −33.8 g, 764 mm; Expedition 657 mm) except for restitution,
+which the off-centre load line shifts by ±0.05 as the block pitches onto
+the road. With one test and eight parameters this is a fit, not a
+validation; the blind row above is the honest number, and a load-cell wall
+(AHOF) record per vehicle is what would pin each box down on its own.
+
+What remains in the Neon's pulse — a soft first 35 ms in the test (−10 g
+where the model gives −30 g) — is the height mismatch at the interface:
+the Navigator's rails ride above the Neon's and meet its hood and
+radiator support first. At 0.3 m elements the boxes are one or two rows
+tall; `--element-size 0.15` resolves the bands properly (the pulse
+vehicles are transverse-grid insensitive at that size) at 4× the run time,
+and is where the fit should be repeated next.
 
 What a homogenised block cannot do: the real car decelerates the cabin
 within 3 ms through stiff rails while the engine mass is still free; the
-block needs ~10 ms for its plastic wave. And it stores less recoverable
-elastic energy than a real body, so restitution is low by ~0.05.
+block needs ~10 ms for its plastic wave.
 
 ## Inputs and outputs
 
@@ -145,7 +193,9 @@ elastic energy than a real body, so restitution is low by ~0.05.
     velocity, acceleration (net force / mass) and kinetic energy.
 
   `--pulse` runs also write `<base>.pulse.parquet` (measured vs simulated
-  acceleration, velocity, crush on one time grid).
+  acceleration, velocity, crush on one time grid); `headon --pulse-a
+  --pulse-b` writes `<base>.pulse_a/b.parquet`, which
+  `examples/plot_headon_pulses.py` plots.
 
   Accelerometers work like LS-DYNA's `*ELEMENT_SEATBELT_ACCELEROMETER`: a
   frame is three nodes (origin, +x node, node in the x–y plane) re-evaluated

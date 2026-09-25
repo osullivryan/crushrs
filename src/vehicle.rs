@@ -75,6 +75,29 @@ pub fn crash3_ratio(a_kg_per_cm: f64, b_kg_per_cm2: f64) -> f64 {
     a_kg_per_cm / b_kg_per_cm2 * 0.01
 }
 
+/// Rail box of a crush zone: the frame rails and the engine between them, the box that carries
+/// most of the barrier force, inside a soft skin (fenders, hood, radiator
+/// support, everything above and outside the rails).
+///
+/// The rail box is the crush-zone elements whose centroid lies within
+/// `width` of the vehicle's lateral centreline and between `z_range`
+/// (heights above the ground). It carries `force_fraction` of the
+/// vehicle's force–crush curve over its own area, the skin the rest over
+/// the remaining area; modulus and density are split the same way, so
+/// rail box and skin have the same wave speed and the same strain history
+/// against a flat rigid barrier: the barrier calibration is untouched. A
+/// partner that overlaps only part of the face (a narrower, lower car)
+/// sees the concentrated load instead of a uniformly spread one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RailBox {
+    /// Lateral extent of the rail box (m), centred on the vehicle.
+    pub width: f64,
+    /// Bottom and top of the rail box above the ground (m).
+    pub z_range: [f64; 2],
+    /// Fraction of the barrier force carried by the rail box (0..1).
+    pub force_fraction: f64,
+}
+
 /// A homogenised vehicle.
 #[derive(Clone, Debug)]
 pub struct Vehicle {
@@ -120,6 +143,9 @@ pub struct Vehicle {
     /// zone carries the plastic wave faster (√(H/ρ)), like real rails
     /// ahead of the engine and cabin mass.
     pub crush_zone_mass: Option<f64>,
+    /// Rail box (frame rails and engine) of the crush zone, see [`RailBox`];
+    /// part `<name>_rails`. Only with a crush zone. `None` = uniform face.
+    pub rail_box: Option<RailBox>,
 }
 
 impl Vehicle {
@@ -152,7 +178,7 @@ impl Vehicle {
             modulus,
             body_modulus: modulus,
             side_curve: None,
-            side_modulus: None, force_table: None, crush_element_size: None, compaction_map: None, crush_zone_mass: None, bumper: None, transverse_factor: Vehicle::TRANSVERSE_FACTOR,
+            side_modulus: None, force_table: None, crush_element_size: None, compaction_map: None, crush_zone_mass: None, bumper: None, rail_box: None, transverse_factor: Vehicle::TRANSVERSE_FACTOR,
         }
     }
 
@@ -178,7 +204,7 @@ impl Vehicle {
             modulus: self.side_modulus.unwrap_or(self.modulus),
             body_modulus: self.side_modulus.unwrap_or(self.modulus),
             side_curve: None,
-            side_modulus: None, force_table: None, crush_element_size: None, compaction_map: None, crush_zone_mass: None, bumper: None, transverse_factor: Vehicle::TRANSVERSE_FACTOR,
+            side_modulus: None, force_table: None, crush_element_size: None, compaction_map: None, crush_zone_mass: None, bumper: None, rail_box: None, transverse_factor: Vehicle::TRANSVERSE_FACTOR,
         }
     }
 
@@ -201,6 +227,42 @@ impl Vehicle {
         format!("{}_bumper", self.name)
     }
 
+    /// Part name of the rail box when `rail_box` is set.
+    pub fn rail_box_part_name(&self) -> String {
+        format!("{}_rails", self.name)
+    }
+
+    /// Part name of the bumper layer over the rail box (the bumper beam on
+    /// the rail ends) when both `bumper` and `rail_box` are set.
+    pub fn bumper_rails_part_name(&self) -> String {
+        format!("{}_bumper_rails", self.name)
+    }
+
+    /// Whether the vehicle is built with a rail box.
+    pub fn has_rail_box(&self) -> bool {
+        self.rail_box.is_some() && self.has_crush_zone()
+    }
+
+    /// Whether a crush-zone element with cross-section centroid `(y, z)`
+    /// (`y` from the vehicle's centreline, `z` above the ground) belongs to
+    /// the rail box.
+    pub fn in_rail_box(&self, y: f64, z: f64) -> bool {
+        match self.rail_box {
+            Some(c) => y.abs() < 0.5 * c.width && z > c.z_range[0] && z < c.z_range[1],
+            None => false,
+        }
+    }
+
+    /// Stress / modulus / density scale factors of the rail box and of the
+    /// skin relative to the uniform crush material, for a rail box occupying
+    /// `area_fraction` of the crush-zone cross-section: the rail box carries
+    /// `force_fraction` of the force over its area, the skin the rest.
+    pub fn rail_box_factors(&self, area_fraction: f64) -> (f64, f64) {
+        let f = self.rail_box.map_or(0.0, |c| c.force_fraction).clamp(0.0, 1.0);
+        let a = area_fraction.clamp(1e-6, 1.0 - 1e-6);
+        (f / a, (1.0 - f) / (1.0 - a))
+    }
+
     /// Length of the honeycomb crush zone proper (crush zone minus bumper).
     pub fn honeycomb_length(&self) -> f64 {
         self.crush_zone_length - self.bumper.map_or(0.0, |b| b[0])
@@ -218,6 +280,52 @@ impl Vehicle {
         // itself stiff enough to fold the plate on impact.
         let h_front = if self.has_crush_zone() { self.crush_element_size.unwrap_or(h) } else { h };
         self.modulus * self.frontal_area() / (n_face as f64 * h_front)
+    }
+
+    /// Per-node factor on the front-face contact penalty (in the order of
+    /// `Mesh::face_set_nodes` of `<name>_front`): the rail-box factor for
+    /// nodes over the rail box, the skin factor elsewhere, averaged over
+    /// the crush-zone columns a node borders. Empty (uniform) without a
+    /// rail box.
+    pub fn front_contact_scales(&self, mesh: &Mesh, element_size: f64) -> Vec<f64> {
+        if !self.has_rail_box() {
+            return Vec::new();
+        }
+        let front = format!("{}_front", self.name);
+        let Some(nodes) = mesh.face_set_nodes(&front) else { return Vec::new() };
+        let ny = (self.size[1] / element_size).round().max(1.0) as usize;
+        let nz = (self.size[2] / element_size).round().max(1.0) as usize;
+        let (dy, dz) = (self.size[1] / ny as f64, self.size[2] / nz as f64);
+        // Face extent from the nodes themselves (any heading, offset, height).
+        let (mut lo, mut hi) = ([f64::MAX; 3], [f64::MIN; 3]);
+        for &n in &nodes {
+            for d in 0..3 {
+                lo[d] = lo[d].min(mesh.nodes[n][d]);
+                hi[d] = hi[d].max(mesh.nodes[n][d]);
+            }
+        }
+        let (y_center, z_bottom) = (0.5 * (lo[1] + hi[1]), lo[2]);
+        let cells = ny * nz;
+        let n_rails = (0..cells).filter(|c| self.in_rail_box((c % ny) as f64 * dy + 0.5 * dy - 0.5 * self.size[1], (c / ny) as f64 * dz + 0.5 * dz)).count();
+        if n_rails == 0 || n_rails == cells {
+            return Vec::new();
+        }
+        let (f_rails, f_skin) = self.rail_box_factors(n_rails as f64 / cells as f64);
+        nodes
+            .iter()
+            .map(|&n| {
+                let p = mesh.nodes[n];
+                let (mut sum, mut count) = (0.0, 0);
+                for (sy, sz) in [(-0.5, -0.5), (0.5, -0.5), (-0.5, 0.5), (0.5, 0.5)] {
+                    let (yc, zc) = (p[1] - y_center + sy * dy, p[2] - z_bottom + sz * dz);
+                    if yc.abs() < 0.5 * self.size[1] && zc > 0.0 && zc < self.size[2] {
+                        sum += if self.in_rail_box(yc, zc) { f_rails } else { f_skin };
+                        count += 1;
+                    }
+                }
+                if count > 0 { sum / count as f64 } else { 1.0 }
+            })
+            .collect()
     }
 
     /// Stiffness scale for contact penalties (N/m).
@@ -277,6 +385,13 @@ impl Vehicle {
     /// Default transverse cap factor of the crush material.
     pub const TRANSVERSE_FACTOR: f64 = 4.0;
 
+    /// Ground clearance (m) of the road under every vehicle model: the
+    /// underbody bottoms out on a rigid road this far below it, which is
+    /// what keeps a nose from diving under a partner or pitching freely
+    /// when the load box sits below the centre of gravity.
+    pub const GROUND_CLEARANCE: f64 = 0.15;
+
+
     /// Compaction at which a tabulated crush material locks up (≈ 75 %
     /// crushed); beyond it the yield stress rises with `LOCK_SLOPE_FACTOR·E`.
     pub const LOCK_COMPACTION: f64 = 1.4;
@@ -322,6 +437,15 @@ impl Vehicle {
         v.crush_element_size = Some(0.1);
         v.crush_zone_mass = Some(190.0);
         v.bumper = Some([0.1, 25.0, 3.0e8]);
+        // Rail box fitted with `calibrate_rail_boxes` to the car-to-car test
+        // 4429 together with the Navigator's (`headon navigator neon-pulse
+        // 30.14 30.14 --mass-b 1378 --pulse-a ... --pulse-b ...
+        // --calibrate-rail-boxes 12`, J 2.92 vs 3.43 for uniform faces):
+        // the front rails and subframe, 0.45 m wide at 0.06–0.41 m,
+        // carrying 80 % of the force. At 0.3 m elements that is the
+        // middle 2 of 6 columns and rows 1–2 of 5 (0–0.54 m). Invisible
+        // to the barrier test above, which stays as fitted.
+        v.rail_box = Some(RailBox { width: 0.45, z_range: [0.06, 0.41], force_fraction: 0.8 });
         v.modulus = 4e6;
         v.body_modulus = 2.7e8;
         let knots = [0.0, 0.1165, 0.2330, 0.3496, 0.4661, 0.5826, 0.6991];
@@ -340,6 +464,12 @@ impl Vehicle {
         v.crush_element_size = Some(0.1);
         v.crush_zone_mass = Some(320.0);
         v.bumper = Some([0.1, 35.0, 3.0e8]);
+        // Rail box fitted to the car-to-car test 4429 (see
+        // `dodge_neon_1996_pulse`): the frame rails and bumper beam,
+        // 1.25 m wide at 0.15–0.72 m, carrying 75 % of the force. At 0.3 m
+        // elements it is the middle 5 of 7 columns and row 2 of 6
+        // (0.32–0.63 m).
+        v.rail_box = Some(RailBox { width: 1.25, z_range: [0.15, 0.72], force_fraction: 0.75 });
         v.modulus = 7.3e6;
         v.body_modulus = 3.93e8;
         // Fitted to test 3124 (`barrier expedition --pulse
@@ -421,16 +551,18 @@ pub enum Heading {
 
 /// Add a vehicle block to the mesh with its front face at `front_x`,
 /// centred on `y_center`, standing on `z_bottom`. Creates part `<name>`
-/// (also a node set) and face set `<name>_front`.
+/// (also a node set), face set `<name>_front` and face set `<name>_bottom`
+/// (the underbody of every part, for a ground contact).
 pub fn add_vehicle(mesh: &mut Mesh, v: &Vehicle, front_x: f64, y_center: f64, z_bottom: f64, heading: Heading, element_size: f64) -> usize {
     let (x0, face) = match heading {
         Heading::PlusX => (front_x - v.size[0], BlockFace::XMax),
         Heading::MinusX => (front_x, BlockFace::XMin),
     };
     let front = format!("{}_front", v.name);
+    let bottom = format!("{}_bottom", v.name);
     let origin = [x0, y_center - v.size[1] / 2.0, z_bottom];
     if !v.has_crush_zone() {
-        return mesh.add_hex_block(&v.name, origin, v.size, element_size, &[(face, &front)]);
+        return mesh.add_hex_block(&v.name, origin, v.size, element_size, &[(face, &front), (BlockFace::ZMin, &bottom)]);
     }
     // Body block (part `<name>`) and crush-zone block (part `<name>_crush`)
     // with matching y/z grids, merged at their shared face.
@@ -446,16 +578,51 @@ pub fn add_vehicle(mesh: &mut Mesh, v: &Vehicle, front_x: f64, y_center: f64, z_
         Heading::PlusX => (x0, x0 + l_b, x0 + l_b + l_c),
         Heading::MinusX => (x0 + l_c + t_b, x0 + t_b, x0),
     };
-    let part = mesh.add_hex_block_n(&v.name, [body_x0, origin[1], origin[2]], [l_b, v.size[1], v.size[2]], [nxb, ny, nz], &[]);
+    // Each block's underbody faces go to a temporary set, merged into
+    // `<name>_bottom` below.
+    let sub = |n: &str| format!("{}_bottom_{}", v.name, n);
+    let part = mesh.add_hex_block_n(&v.name, [body_x0, origin[1], origin[2]], [l_b, v.size[1], v.size[2]], [nxb, ny, nz], &[(BlockFace::ZMin, &sub("body"))]);
     let crush_name = v.crush_part_name();
     let mut names = vec![crush_name.clone()];
+    let mut bottoms = vec![sub("body"), sub("crush")];
+    let crush_part;
     if t_b > 0.0 {
-        mesh.add_hex_block_n(&crush_name, [crush_x0, origin[1], origin[2]], [l_c, v.size[1], v.size[2]], [nxc, ny, nz], &[]);
+        crush_part = mesh.add_hex_block_n(&crush_name, [crush_x0, origin[1], origin[2]], [l_c, v.size[1], v.size[2]], [nxc, ny, nz], &[(BlockFace::ZMin, &sub("crush"))]);
         let bumper_name = v.bumper_part_name();
-        mesh.add_hex_block_n(&bumper_name, [bumper_x0, origin[1], origin[2]], [t_b, v.size[1], v.size[2]], [1, ny, nz], &[(face, &front)]);
+        mesh.add_hex_block_n(&bumper_name, [bumper_x0, origin[1], origin[2]], [t_b, v.size[1], v.size[2]], [1, ny, nz], &[(face, &front), (BlockFace::ZMin, &sub("bumper"))]);
         names.push(bumper_name);
+        bottoms.push(sub("bumper"));
     } else {
-        mesh.add_hex_block_n(&crush_name, [crush_x0, origin[1], origin[2]], [l_c, v.size[1], v.size[2]], [nxc, ny, nz], &[(face, &front)]);
+        crush_part = mesh.add_hex_block_n(&crush_name, [crush_x0, origin[1], origin[2]], [l_c, v.size[1], v.size[2]], [nxc, ny, nz], &[(face, &front), (BlockFace::ZMin, &sub("crush"))]);
+    }
+    let mut bottom_faces = Vec::new();
+    for b in &bottoms {
+        bottom_faces.extend(mesh.face_sets.remove(b).unwrap_or_default());
+    }
+    mesh.face_sets.insert(bottom, bottom_faces);
+    if v.has_rail_box() {
+        // Move the crush-zone elements inside the rail box to their own
+        // part, and the bumper elements over it to theirs (the bumper beam
+        // on the rail ends); the node sets still span the whole blocks.
+        let bumper_part = mesh.part_index(&v.bumper_part_name());
+        let mut carve = vec![(crush_part, v.rail_box_part_name())];
+        if let Some(b) = bumper_part {
+            carve.push((b, v.bumper_rails_part_name()));
+        }
+        for (from, to) in carve {
+            let to = mesh.add_part(&to);
+            for e in 0..mesh.hexes.len() {
+                if mesh.hex_part[e] != from {
+                    continue;
+                }
+                let h = mesh.hexes[e];
+                let yc = h.iter().map(|n| mesh.nodes[*n][1]).sum::<f64>() / 8.0 - y_center;
+                let zc = h.iter().map(|n| mesh.nodes[*n][2]).sum::<f64>() / 8.0 - z_bottom;
+                if v.in_rail_box(yc, zc) {
+                    mesh.hex_part[e] = to;
+                }
+            }
+        }
     }
     mesh.merge_coincident_nodes(1e-6 * element_size);
     // Node set `<name>` spans all parts (initial velocity, delta-v).
@@ -476,9 +643,31 @@ pub fn add_vehicle(mesh: &mut Mesh, v: &Vehicle, front_x: f64, y_center: f64, z_
 pub fn assign_vehicle(model: &mut Model, v: &Vehicle, heading: Heading, speed: f64) {
     if v.has_crush_zone() && model.mesh.part_index(&v.crush_part_name()).is_some() {
         model.set_material(&v.name, v.body_material());
-        model.set_material(&v.crush_part_name(), v.crush_material());
-        if let (Some(b), Some(_)) = (v.bumper, model.mesh.part_index(&v.bumper_part_name())) {
-            model.set_material(&v.bumper_part_name(), Material::elastic(b[2], 0.3, b[1] / (b[0] * v.frontal_area())));
+        let crush = v.crush_material();
+        let plate = v.bumper.map(|b| Material::elastic(b[2], 0.3, b[1] / (b[0] * v.frontal_area())));
+        let rails = if v.has_rail_box() { model.mesh.part_index(&v.rail_box_part_name()) } else { None };
+        let (f_rails, f_skin) = match rails {
+            Some(rails) => {
+                let skin = model.mesh.part_index(&v.crush_part_name()).unwrap();
+                let (n_rails, n_skin) = (model.mesh.part_hexes(rails).len() as f64, model.mesh.part_hexes(skin).len() as f64);
+                // Every x-layer of the crush zone has the same cross-section,
+                // so the element count ratio is the area ratio. A box that
+                // holds all of the face, or none of it, is a uniform face.
+                if n_rails > 0.0 && n_skin > 0.0 { v.rail_box_factors(n_rails / (n_rails + n_skin)) } else { (1.0, 1.0) }
+            }
+            None => (1.0, 1.0),
+        };
+        if rails.is_some() {
+            model.set_material(&v.rail_box_part_name(), crush.scaled(f_rails));
+        }
+        model.set_material(&v.crush_part_name(), crush.scaled(f_skin));
+        if let Some(plate) = plate {
+            if model.mesh.part_index(&v.bumper_part_name()).is_some() {
+                model.set_material(&v.bumper_part_name(), plate.scaled(f_skin));
+            }
+            if model.mesh.part_index(&v.bumper_rails_part_name()).is_some() {
+                model.set_material(&v.bumper_rails_part_name(), plate.scaled(f_rails));
+            }
         }
     } else {
         model.set_material(&v.name, v.crush_material());
@@ -525,6 +714,30 @@ pub fn add_vehicle_accelerometer(model: &mut Model, part: &str, front_face: &str
     name
 }
 
+/// Rigid ground: a fixed stiff slab whose top face is at height `z`,
+/// spanning `x` and `y`. Creates part `<name>` and face set `<name>_face`.
+/// Pair it with the vehicles' `<name>_bottom` sets ([`add_ground_contact`])
+/// so a nose pushed down (underride) bottoms out on the road after its
+/// ground clearance instead of diving freely.
+pub fn add_ground(mesh: &mut Mesh, name: &str, z: f64, x: [f64; 2], y: [f64; 2], thickness: f64) -> usize {
+    let face_name = format!("{}_face", name);
+    let h = ((x[1] - x[0]).min(y[1] - y[0]) / 8.0).max(thickness);
+    mesh.add_hex_block(name, [x[0], y[0], z - thickness], [x[1] - x[0], y[1] - y[0], thickness], h, &[(BlockFace::ZMax, &face_name)])
+}
+
+/// Fix the ground and let vehicle `v` (its `<name>_bottom` set) rest on it,
+/// `clearance` metres above it: one-way penalty contact at the vehicle's
+/// front-contact stiffness per node.
+pub fn add_ground_contact(model: &mut Model, v: &Vehicle, ground: &str, clearance: f64, element_size: f64) {
+    if model.mesh.part_index(ground).is_none() {
+        return;
+    }
+    let bottom = format!("{}_bottom", v.name);
+    let n_face = model.mesh.face_set_nodes(&format!("{}_front", v.name)).map_or(1, |f| f.len());
+    model.set_material(ground, Material::elastic(1e9, 0.3, 1000.0)).fix(ground);
+    model.add_contact_one_way(&bottom, &format!("{}_face", ground), v.contact_stiffness_per_node(n_face, element_size), clearance + 0.3);
+}
+
 /// Rigid barrier: a fixed stiff block with its contact face at `x`. Creates
 /// part `<name>` and face set `<name>_face`.
 pub fn add_rigid_wall(mesh: &mut Mesh, name: &str, x: f64, y: [f64; 2], z: [f64; 2], facing: Heading, thickness: f64) -> usize {
@@ -564,9 +777,9 @@ pub fn barrier_metrics(model: &Model, results: &Results, part: &str, axis: usize
 /// [`barrier_metrics`] with an energy-equivalent stiffness window other than
 /// NCAP's 25–400 mm (e.g. for side profiles that crush less).
 pub fn barrier_metrics_window(model: &Model, results: &Results, part: &str, axis: usize, window: (f64, f64)) -> BarrierMetrics {
-    let p = model.mesh.part_index(part).unwrap_or_else(|| panic!("no part '{}'", part));
-    // A vehicle built with a crush zone is two parts: combine them.
-    let parts: Vec<usize> = [Some(p), model.mesh.part_index(&format!("{}_crush", part)), model.mesh.part_index(&format!("{}_bumper", part))].into_iter().flatten().collect();
+    model.mesh.part_index(part).unwrap_or_else(|| panic!("no part '{}'", part));
+    // A vehicle built with a crush zone is several parts: combine them.
+    let parts: Vec<usize> = ["", "_crush", "_rails", "_bumper", "_bumper_rails"].iter().filter_map(|s| model.mesh.part_index(&format!("{}{}", part, s))).collect();
     let series: Vec<(f64, f64, f64, f64)> = results
         .history
         .iter()
@@ -633,15 +846,18 @@ pub fn barrier_model(v: &Vehicle, element_size: f64, speed: f64, end_time: f64, 
     add_vehicle(&mut mesh, v, -gap, 0.0, 0.0, Heading::PlusX, element_size);
     let (w, z) = (v.size[1], v.size[2]);
     add_rigid_wall(&mut mesh, "wall", 0.0, [-w * 0.75, w * 0.75], [-0.2 * z, 1.2 * z], Heading::MinusX, 0.2);
+    add_ground(&mut mesh, "ground", -Vehicle::GROUND_CLEARANCE, [-v.size[0] - 1.0, -0.3], [-w, w], 0.3);
     let mut model = Model::new(mesh);
     assign_vehicle(&mut model, v, Heading::PlusX, speed);
     model.set_material("wall", Material::elastic(1e9, 0.3, 1000.0)).fix("wall");
+    add_ground_contact(&mut model, v, "ground", Vehicle::GROUND_CLEARANCE, element_size);
     // Contact penalty per node: much stiffer than the crush stiffness shared
     // over the front-face nodes, so the penalty springs store ≲1 % of the
     // energy (otherwise they return it as spurious restitution).
     let n_face = model.mesh.face_set_nodes(&format!("{}_front", v.name)).unwrap().len();
     let front = format!("{}_front", v.name);
-    model.add_contact_pair(&front, "wall_face", v.contact_stiffness_per_node(n_face, element_size), 0.3);
+    let scales = v.front_contact_scales(&model.mesh, element_size);
+    model.add_contact_pair_scaled(&front, "wall_face", v.contact_stiffness_per_node(n_face, element_size), 0.3, scales, Vec::new());
     model.settings.end_time = end_time;
     model.settings.history_steps = 2;
     model.settings.frame_steps = frame_steps;

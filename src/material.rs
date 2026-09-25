@@ -193,6 +193,27 @@ impl Material {
         self.plasticity.is_some()
     }
 
+    /// The same material with every stress-like quantity (modulus, yield
+    /// stress, hardening, curve stresses, lock-up slope) and the density
+    /// multiplied by `factor`: a region carrying `factor` times the load
+    /// per unit area with the same wave speed and strain history.
+    pub fn scaled(&self, factor: f64) -> Self {
+        let mut m = self.clone();
+        m.youngs_modulus *= factor;
+        m.density *= factor;
+        if let Some(p) = m.plasticity.as_mut() {
+            p.yield_stress *= factor;
+            p.hardening *= factor;
+            for k in &mut p.curve {
+                k[1] *= factor;
+            }
+            if let Some(d) = p.densification.as_mut() {
+                d[1] *= factor;
+            }
+        }
+        m
+    }
+
     pub fn model(&self) -> Option<PlasticModel> {
         self.plasticity.as_ref().map(|p| p.model)
     }

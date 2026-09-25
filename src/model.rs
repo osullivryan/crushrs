@@ -19,6 +19,12 @@ pub struct Contact {
     /// box at start are ignored, and penetrations deeper than this are
     /// treated as spurious (the far side of a thin body).
     pub max_distance: f64,
+    /// Per-node factor on `stiffness`, aligned with `nodes` (empty = all
+    /// 1): the penalty follows the stiffness of the structure behind each
+    /// node, so a stiff rail box and its soft skin penetrate alike and the
+    /// springs store the same small share of the energy everywhere.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub node_scale: Vec<f64>,
 }
 
 /// A body-fixed coordinate system defined by three nodes, like LS-DYNA's
@@ -228,14 +234,32 @@ impl Model {
         self
     }
 
+    /// One-way contact: the nodes of face set `nodes` against the faces of
+    /// `faces` at the full `stiffness` per node (e.g. a body against a fixed
+    /// ground, whose own nodes never move).
+    pub fn add_contact_one_way(&mut self, nodes: &str, faces: &str, stiffness: f64, max_distance: f64) -> &mut Self {
+        let n = self.mesh.face_set_nodes(nodes).unwrap_or_else(|| panic!("no face set '{}'", nodes));
+        let f = self.mesh.face_set(faces).unwrap_or_else(|| panic!("no face set '{}'", faces)).clone();
+        self.contacts.push(Contact { nodes: n, faces: f, stiffness, max_distance, node_scale: Vec::new() });
+        self
+    }
+
     /// Two-way contact between two face sets: each side's nodes against the
     /// other's faces, at half `stiffness` each so coincident nodes are not
     /// double-counted (the surfaces see `stiffness` per node overall).
     pub fn add_contact_pair(&mut self, a: &str, b: &str, stiffness: f64, max_distance: f64) -> &mut Self {
-        for (p, s) in [(a, b), (b, a)] {
+        self.add_contact_pair_scaled(a, b, stiffness, max_distance, Vec::new(), Vec::new())
+    }
+
+    /// [`add_contact_pair`](Self::add_contact_pair) with a per-node factor
+    /// on the stiffness for each side's nodes (in the order of
+    /// [`Mesh::face_set_nodes`]; empty = uniform).
+    pub fn add_contact_pair_scaled(&mut self, a: &str, b: &str, stiffness: f64, max_distance: f64, scale_a: Vec<f64>, scale_b: Vec<f64>) -> &mut Self {
+        for (p, s, scale) in [(a, b, scale_a), (b, a, scale_b)] {
             let nodes = self.mesh.face_set_nodes(p).unwrap_or_else(|| panic!("no face set '{}'", p));
             let faces = self.mesh.face_set(s).unwrap_or_else(|| panic!("no face set '{}'", s)).clone();
-            self.contacts.push(Contact { nodes, faces, stiffness: 0.5 * stiffness, max_distance });
+            assert!(scale.is_empty() || scale.len() == nodes.len(), "contact node scale length {} vs {} nodes of '{}'", scale.len(), nodes.len(), p);
+            self.contacts.push(Contact { nodes, faces, stiffness: 0.5 * stiffness, max_distance, node_scale: scale });
         }
         self
     }

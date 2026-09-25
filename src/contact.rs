@@ -7,6 +7,8 @@ use nalgebra::Vector3;
 #[derive(Debug, Clone)]
 pub struct ContactRuntime {
     nodes: Vec<usize>,
+    /// Stiffness factor per entry of `nodes`.
+    scales: Vec<f64>,
     faces: Vec<[usize; 4]>,
     stiffness: f64,
     max_distance: f64,
@@ -55,16 +57,16 @@ impl ContactRuntime {
         }
         lo = lo.add_scalar(-c.max_distance);
         hi = hi.add_scalar(c.max_distance);
-        let nodes = c
-            .nodes
-            .iter()
-            .copied()
-            .filter(|n| {
-                let p = Vector3::from(positions[*n]);
-                p >= lo && p <= hi
-            })
-            .collect();
-        ContactRuntime { nodes, faces: c.faces.iter().map(|f| faces[*f]).collect(), stiffness: c.stiffness, max_distance: c.max_distance, depth_cap: 0.1 * c.max_distance, penetration_count: 0, max_penetration: 0.0 }
+        let mut nodes = Vec::new();
+        let mut scales = Vec::new();
+        for (i, &n) in c.nodes.iter().enumerate() {
+            let p = Vector3::from(positions[n]);
+            if p >= lo && p <= hi {
+                nodes.push(n);
+                scales.push(c.node_scale.get(i).copied().unwrap_or(1.0));
+            }
+        }
+        ContactRuntime { nodes, scales, faces: c.faces.iter().map(|f| faces[*f]).collect(), stiffness: c.stiffness, max_distance: c.max_distance, depth_cap: 0.1 * c.max_distance, penetration_count: 0, max_penetration: 0.0 }
     }
 
     /// Maximum contact acceleration a node may receive (m/s²): bounds the
@@ -108,7 +110,7 @@ impl ContactRuntime {
             .collect();
         self.penetration_count = 0;
         self.max_penetration = 0.0;
-        for &n in &self.nodes {
+        for (&n, &scale) in self.nodes.iter().zip(&self.scales) {
             let point = cur(n);
             for (fi, face) in faces.iter().enumerate() {
                 if point.x < face.lo.x || point.x > face.hi.x || point.y < face.lo.y || point.y > face.hi.y || point.z < face.lo.z || point.z > face.hi.z {
@@ -132,7 +134,7 @@ impl ContactRuntime {
                 // detection missed it) is pushed out steadily instead of
                 // being kicked at hundreds of m/s.
                 let depth = (-signed).min(self.depth_cap);
-                let k = self.stiffness.min(Self::SOFT * masses[n] / (dt * dt));
+                let k = (self.stiffness * scale).min(Self::SOFT * masses[n] / (dt * dt));
                 // Damping on the approach velocity (node into face), never
                 // pulling: keeps light nodes from chattering on the spring.
                 let fn_ = self.faces[fi];

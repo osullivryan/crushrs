@@ -7,6 +7,7 @@
 
 use clap::{Args, Parser, Subcommand};
 use crushrs::output::gif::{write_gif, GifOptions};
+use crushrs::headon::HeadOn;
 use crushrs::vehicle::{add_vehicle, add_vehicle_accelerometer, assign_vehicle, barrier_metrics_window, barrier_model, calibrate, calibrate_pulse, BarrierTargets, Heading, PulseComparison, Vehicle, PULSE_DT, PULSE_END};
 use crushrs::{BlockFace, Mesh, Model, Results, MPH};
 use nalgebra::Vector3;
@@ -94,6 +95,27 @@ enum Cmd {
         /// Test mass of vehicle B (kg).
         #[arg(long)]
         mass_b: Option<f64>,
+        /// Ground clearance (m): a rigid road this far below the vehicles'
+        /// underbodies stops a nose from diving under the other vehicle.
+        #[arg(long, default_value_t = Vehicle::GROUND_CLEARANCE)]
+        clearance: f64,
+        /// No road: the vehicles are free in space.
+        #[arg(long)]
+        no_ground: bool,
+        /// Uniform faces: drop the vehicles' rail boxes.
+        #[arg(long)]
+        no_rail_box: bool,
+        /// Transverse element size (m); the crush zones keep their own
+        /// length-wise size.
+        #[arg(long, default_value_t = Vehicle::TUNED_ELEMENT_SIZE)]
+        element_size: f64,
+        /// Fit both vehicles' rail boxes to --pulse-a / --pulse-b by
+        /// differential evolution for N generations (population 12).
+        #[arg(long)]
+        calibrate_rail_boxes: Option<usize>,
+        /// Population of the rail-box calibration.
+        #[arg(long, default_value_t = 12)]
+        population: usize,
         #[command(flatten)]
         out: Out,
     },
@@ -357,7 +379,7 @@ fn main() {
             println!("restitution e = {:.3};  momentum {:.0} -> {:.0} kg·m/s", (vc[0] - vt[0]) / (v_t0 - v_c0), mt * v_t0 + mc * v_c0, mt * vt[0] + mc * vc[0]);
             outputs(&model, &results, &out, None);
         }
-        Cmd::Headon { vehicle_a, vehicle_b, mph_a, mph_b, offset, pulse_a, pulse_b, mass_a, mass_b, out } => {
+        Cmd::Headon { vehicle_a, vehicle_b, mph_a, mph_b, offset, pulse_a, pulse_b, mass_a, mass_b, clearance, no_ground, no_rail_box, element_size, calibrate_rail_boxes, population, out } => {
             let mut a = vehicle_by_name(&vehicle_a);
             let mut b = vehicle_by_name(&vehicle_b);
             if let Some(m) = mass_a {
@@ -366,23 +388,31 @@ fn main() {
             if let Some(m) = mass_b {
                 b = b.with_mass(m);
             }
+            if no_rail_box {
+                a.rail_box = None;
+                b.rail_box = None;
+            }
             a.name = format!("{}_a", a.name);
             b.name = format!("{}_b", b.name);
-            let h = Vehicle::TUNED_ELEMENT_SIZE;
-            let gap = 0.005;
-            let mut mesh = Mesh::new();
-            add_vehicle(&mut mesh, &a, -gap, 0.0, 0.0, Heading::PlusX, h);
-            add_vehicle(&mut mesh, &b, gap, offset, 0.0, Heading::MinusX, h);
-            let mut model = Model::new(mesh);
-            assign_vehicle(&mut model, &a, Heading::PlusX, mph_a * MPH);
-            assign_vehicle(&mut model, &b, Heading::MinusX, mph_b * MPH);
+            let mut setup = HeadOn::new(mph_a * MPH, mph_b * MPH);
+            setup.offset = offset;
+            setup.clearance = if no_ground { None } else { Some(clearance) };
+            setup.element_size = element_size;
+            let read = |file: &Option<String>| file.as_ref().map(|f| crushrs::signal::Pulse::read_nhtsa_list(f, true).unwrap_or_else(|e| panic!("{}", e)));
+            let (meas_a, meas_b) = (read(&pulse_a), read(&pulse_b));
+            if let Some(generations) = calibrate_rail_boxes {
+                let (Some(pa), Some(pb)) = (&meas_a, &meas_b) else { panic!("--calibrate-rail boxes needs --pulse-a and --pulse-b") };
+                let fit = crushrs::headon::calibrate_rail_boxes(&a, &b, &setup, pa, pb, population, generations, true);
+                println!("rail-box calibration: J {:.3} after {} runs", fit.objective, fit.evaluations);
+                for v in [&fit.a, &fit.b] {
+                    let c = v.rail_box.unwrap();
+                    println!("  {}: RailBox {{ width: {:.3}, z_range: [{:.3}, {:.3}], force_fraction: {:.3} }}", v.name, c.width, c.z_range[0], c.z_range[1], c.force_fraction);
+                }
+                a = fit.a;
+                b = fit.b;
+            }
+            let (mut model, acc_a, acc_b) = setup.build(&a, &b);
             let (fa, fb) = (format!("{}_front", a.name), format!("{}_front", b.name));
-            let n_face = model.mesh.face_set_nodes(&fa).unwrap().len().min(model.mesh.face_set_nodes(&fb).unwrap().len());
-            model.add_contact_pair(&fa, &fb, a.contact_stiffness_per_node(n_face, h).min(b.contact_stiffness_per_node(n_face, h)), 0.3);
-            model.settings.end_time = 0.15;
-            let acc_a = add_vehicle_accelerometer(&mut model, &a.name, &fa);
-            let acc_b = add_vehicle_accelerometer(&mut model, &b.name, &fb);
-            model.settings.history_steps = 1;
             out.configure(&mut model);
             let results = crushrs::run(&model);
             let (ma, dva, va) = part_delta_v(&model, &results, &a.name);
@@ -395,9 +425,9 @@ fn main() {
             println!("{:<12} {:+7.2} m/s {:+6.1} mph   {:4.0} mm   {:6.1} g      ({:+.2} m/s)", a.name, dva[0], dva[0] / MPH, crush_rear(&model, &results, &acc_a, &fa) * 1e3, peak_g(&model, &results, &acc_a).unwrap_or(f64::NAN), v_common - v_a0);
             println!("{:<12} {:+7.2} m/s {:+6.1} mph   {:4.0} mm   {:6.1} g      ({:+.2} m/s)", b.name, dvb[0], dvb[0] / MPH, crush_rear(&model, &results, &acc_b, &fb) * 1e3, peak_g(&model, &results, &acc_b).unwrap_or(f64::NAN), v_common - v_b0);
             println!("restitution e = {:.3};  momentum {:.0} -> {:.0} kg·m/s", (vb[0] - va[0]) / (v_a0 - v_b0), ma * v_a0 + mb * v_b0, ma * va[0] + mb * vb[0]);
-            for (label, file, acc, speed, sign) in [("A", pulse_a, &acc_a, mph_a * MPH, 1.0), ("B", pulse_b, &acc_b, mph_b * MPH, -1.0)] {
-                let Some(file) = file else { continue };
-                let measured = crushrs::signal::Pulse::read_nhtsa_list(&file, true).unwrap_or_else(|e| panic!("{}", e)).filtered(60.0).resampled(PULSE_DT).truncated(PULSE_END);
+            for (label, file, measured, acc, speed, sign) in [("A", &pulse_a, &meas_a, &acc_a, mph_a * MPH, 1.0), ("B", &pulse_b, &meas_b, &acc_b, mph_b * MPH, -1.0)] {
+                let (Some(file), Some(measured)) = (file, measured) else { continue };
+                let measured = measured.filtered(60.0).resampled(PULSE_DT).truncated(PULSE_END);
                 let mut sim = crushrs::signal::Pulse::from_history(&model, &results, acc, PULSE_DT).unwrap();
                 // Vehicle B heads −X: express its pulse forward-positive.
                 sim.accel.iter_mut().for_each(|a| *a *= sign);
@@ -410,7 +440,7 @@ fn main() {
                 for i in (0..cmp.time.len()).step_by(step) {
                     println!("  {:5.0}   {:6.1}   {:6.1}       {:6.2}   {:6.2}       {:6.0}   {:6.0}", cmp.time[i] * 1e3, cmp.a_meas[i] / 9.81, cmp.a_sim[i] / 9.81, cmp.v_meas[i], cmp.v_sim[i], cmp.x_meas[i] * 1e3, cmp.x_sim[i] * 1e3);
                 }
-                println!("  peak (CFC60) {:.1} / {:.1} g, max crush {:.0} / {:.0} mm at {:.0} / {:.0} ms, delta-v at {:.0} ms {:.2} / {:.2} m/s, rms {:.2} g  (measured / simulated)", cmp.meas.peak_accel / 9.81, cmp.sim.peak_accel / 9.81, cmp.meas.max_crush * 1e3, cmp.sim.max_crush * 1e3, cmp.meas.t_max_crush * 1e3, cmp.sim.t_max_crush * 1e3, cmp.time.last().unwrap() * 1e3, speed - cmp.v_meas.last().unwrap(), speed - cmp.v_sim.last().unwrap(), cmp.rms_accel_error() / 9.81);
+                println!("  peak (CFC60) {:.1} / {:.1} g, max crush {:.0} / {:.0} mm at {:.0} / {:.0} ms, delta-v at {:.0} ms {:.2} / {:.2} m/s, rms {:.2} g, J {:.3}  (measured / simulated)", cmp.meas.peak_accel / 9.81, cmp.sim.peak_accel / 9.81, cmp.meas.max_crush * 1e3, cmp.sim.max_crush * 1e3, cmp.meas.t_max_crush * 1e3, cmp.sim.t_max_crush * 1e3, cmp.time.last().unwrap() * 1e3, speed - cmp.v_meas.last().unwrap(), speed - cmp.v_sim.last().unwrap(), cmp.rms_accel_error() / 9.81, crushrs::vehicle::pulse_objective(&cmp));
                 if let Some(base) = &out.history {
                     let path = format!("{}.pulse_{}.parquet", base, label.to_lowercase());
                     cmp.write_parquet(Path::new(&path)).expect("write pulse");
