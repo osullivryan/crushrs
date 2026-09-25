@@ -16,7 +16,7 @@ head-on crash takes about 0.2 s.
 cargo run --release -- crash 30 30 --gif crash.gif          # Silverado vs Neon head-on
 cargo run --release -- tbone 30 0 -1.2 --vtk out/tbone      # Silverado into the Neon's side
 cargo run --release -- barrier neon                         # NCAP barrier test vs NHTSA targets
-cargo run --release -- run examples/crash_impact.toml       # any TOML setup
+cargo run --release -- run examples/crash_impact.toml       # any TOML setup (writes out/crash.*.parquet)
 ```
 
 ```
@@ -64,6 +64,36 @@ crush curve from FMVSS 214 barrier-test coefficients).
 - **VTK:** binary `.vtu` per frame + `.pvd` time series (ParaView, VisIt,
   PyVista, meshio). Point data: displacement. Cell data: plastic strain /
   compaction, stress, part, eroded.
+- **History (the binout):** `--history out/run` (or `output.history` in
+  TOML) writes Parquet tables sampled every `history_steps` steps (1 =
+  every step, i.e. ~10–50 kHz here):
+  - `out/run.nodes.parquet` — accelerometer samples: `time, step,
+    accelerometer, node`, position `x y z`, and displacement / velocity /
+    acceleration in global axes (`ux.. vx.. ax..`) and in the
+    accelerometer's body-fixed frame (`lux.. lvx.. lax..`).
+  - `out/run.frames.parquet` — each accelerometer's frame at each sample:
+    origin `ox oy oz` and the local unit axes in global components
+    (`ex_x ex_y ex_z`, `ey_*`, `ez_*`), so any global quantity can be
+    re-expressed locally afterwards.
+  - `out/run.parts.parquet` — per-part mass-weighted mean displacement,
+    velocity, acceleration (net force / mass) and kinetic energy.
+
+  Accelerometers work like LS-DYNA's `*ELEMENT_SEATBELT_ACCELEROMETER`: a
+  frame is three nodes (origin, +x node, node in the x–y plane) re-evaluated
+  from the deformed mesh, so it rotates with the body. `at = [x, y, z]` picks
+  the part node nearest a point and builds the frame from its neighbours
+  (local axes start parallel to global); `nodes = [...]` / `set = "..."`
+  plus `frame = { origin, x_axis, plane }` give full control. The `crash`,
+  `tbone` and `barrier` commands add a rear-seat accelerometer per vehicle.
+  The time step is adaptive, so `time` is not uniformly spaced — resample
+  before filtering (e.g. to 10 kHz, then CFC60 for NCAP comparisons).
+
+  ```python
+  import pandas as pd
+  n = pd.read_parquet("out/run.nodes.parquet")
+  neon = n[n.accelerometer == "neon_rear"].set_index("time")
+  neon.lax.plot()          # longitudinal acceleration in the car's own frame
+  ```
 - **GIF:** built-in software renderer coloured by plastic strain.
 
 ## Caveats

@@ -19,7 +19,7 @@ pub mod vehicle;
 
 pub use material::{Material, PlasticModel, Plasticity};
 pub use mesh::{BlockFace, Mesh};
-pub use model::{Contact, Model, Settings};
+pub use model::{Accelerometer, Contact, LocalFrame, Model, Settings};
 pub use solver::{run, Results};
 
 pub const MPH: f64 = 0.44704;

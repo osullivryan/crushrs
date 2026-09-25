@@ -5,9 +5,9 @@
 //!   crushrs crash 30 30 --gif crash.gif        # Silverado vs Neon head-on
 //!   crushrs tbone 30 0 -1.2 --vtk out/tbone    # Silverado into the Neon's side
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use crushrs::output::gif::{write_gif, GifOptions};
-use crushrs::vehicle::{add_vehicle, assign_vehicle, barrier_metrics_window, calibrate, run_barrier_test, BarrierTargets, Heading, Vehicle};
+use crushrs::vehicle::{add_vehicle, add_vehicle_accelerometer, assign_vehicle, barrier_metrics_window, calibrate, barrier_model, BarrierTargets, Heading, Vehicle};
 use crushrs::{BlockFace, Mesh, Model, Results, MPH};
 use nalgebra::Vector3;
 use std::path::Path;
@@ -24,10 +24,8 @@ enum Cmd {
     /// Run a TOML setup file.
     Run {
         file: String,
-        #[arg(long)]
-        gif: Option<String>,
-        #[arg(long)]
-        vtk: Option<String>,
+        #[command(flatten)]
+        out: Out,
     },
     /// NCAP-style 35 mph rigid-barrier test of a calibrated vehicle.
     Barrier {
@@ -38,10 +36,8 @@ enum Cmd {
         /// Calibrate from the starting point for N iterations.
         #[arg(long)]
         calibrate: Option<usize>,
-        #[arg(long)]
-        gif: Option<String>,
-        #[arg(long)]
-        vtk: Option<String>,
+        #[command(flatten)]
+        out: Out,
     },
     /// Head-on 2007 Silverado vs 1996 Neon.
     Crash {
@@ -49,10 +45,8 @@ enum Cmd {
         truck_mph: f64,
         #[arg(default_value_t = 30.0)]
         car_mph: f64,
-        #[arg(long)]
-        gif: Option<String>,
-        #[arg(long)]
-        vtk: Option<String>,
+        #[command(flatten)]
+        out: Out,
     },
     /// T-bone: Silverado into the side of a Neon.
     Tbone {
@@ -64,14 +58,45 @@ enum Cmd {
         /// Impact point along the Neon relative to its centre (+ toward its front).
         #[arg(default_value_t = 0.0, allow_hyphen_values = true)]
         offset: f64,
-        #[arg(long)]
-        gif: Option<String>,
-        #[arg(long)]
-        vtk: Option<String>,
+        #[command(flatten)]
+        out: Out,
     },
 }
 
-fn outputs(model: &Model, results: &Results, gif: &Option<String>, vtk: &Option<String>, view: Option<Vector3<f64>>) {
+#[derive(Args, Clone, Default)]
+struct Out {
+    /// Animated GIF of the deformed mesh.
+    #[arg(long)]
+    gif: Option<String>,
+    /// VTK time series: <base>.pvd + <base>_NNNN.vtu.
+    #[arg(long)]
+    vtk: Option<String>,
+    /// Parquet time series: <base>.nodes/.frames/.parts.parquet.
+    #[arg(long)]
+    history: Option<String>,
+    /// Sample the history every N steps.
+    #[arg(long, default_value_t = 1)]
+    history_steps: usize,
+}
+
+impl Out {
+    /// Turn on frame / history capture as needed.
+    fn configure(&self, model: &mut Model) {
+        if (self.gif.is_some() || self.vtk.is_some()) && model.settings.frame_steps == 0 {
+            model.settings.frame_steps = 15;
+        }
+        if self.history.is_some() {
+            model.settings.history_steps = self.history_steps.max(1);
+        }
+    }
+}
+
+fn outputs(model: &Model, results: &Results, out: &Out, view: Option<Vector3<f64>>) {
+    let (gif, vtk) = (&out.gif, &out.vtk);
+    if let Some(base) = &out.history {
+        let paths = crushrs::output::history::write_history(model, results, Path::new(base)).expect("write history");
+        println!("wrote {} ({} node samples, {} part samples)", paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", "), results.node_history.time.len(), results.history.len());
+    }
     if let Some(path) = gif {
         let mut opts = GifOptions { delay_cs: 5, plastic_strain_scale: 1.0, ..Default::default() };
         if let Some(v) = view {
@@ -109,15 +134,17 @@ fn crush_x(model: &Model, results: &Results, part: &str, front_set: &str, len0: 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).format_timestamp(None).init();
     match Cli::parse().cmd {
-        Cmd::Run { file, gif, vtk } => {
+        Cmd::Run { file, mut out } => {
             let path = Path::new(&file);
             let cfg = crushrs::input::config::Config::load(path).unwrap_or_else(|e| panic!("{}", e));
             let mut model = cfg.build(path.parent().unwrap_or(Path::new("."))).unwrap_or_else(|e| panic!("{}", e));
-            let gif = gif.or(cfg.output.gif.clone());
-            let vtk = vtk.or(cfg.output.vtk.clone());
-            if (gif.is_some() || vtk.is_some()) && model.settings.frame_steps == 0 {
-                model.settings.frame_steps = 15;
+            out.gif = out.gif.or(cfg.output.gif.clone());
+            out.vtk = out.vtk.or(cfg.output.vtk.clone());
+            out.history = out.history.or(cfg.output.history.clone());
+            if model.settings.history_steps > 0 {
+                out.history_steps = model.settings.history_steps;
             }
+            out.configure(&mut model);
             let results = crushrs::run(&model);
             println!("{} elements, {} steps, {:.2?} ({:.0} ms simulated)", model.mesh.hexes.len(), results.steps, results.wall_time, results.time * 1e3);
             for (p, part) in model.mesh.parts.iter().enumerate() {
@@ -125,9 +152,9 @@ fn main() {
                 let _ = p;
                 println!("{:<16} {:8.0} kg   delta-v [{:+7.2} {:+7.2} {:+7.2}] m/s  |dv| {:5.1} mph", part.name, m, dv[0], dv[1], dv[2], (dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2]).sqrt() / MPH);
             }
-            outputs(&model, &results, &gif, &vtk, None);
+            outputs(&model, &results, &out, None);
         }
-        Cmd::Barrier { vehicle, element_size, calibrate: cal, gif, vtk } => {
+        Cmd::Barrier { vehicle, element_size, calibrate: cal, out } => {
             let (v, target) = match vehicle.as_str() {
                 "silverado" => (Vehicle::chevrolet_silverado_2007_tuned(), Vehicle::chevrolet_silverado_2007()),
                 "silverado-raw" => (Vehicle::chevrolet_silverado_2007(), Vehicle::chevrolet_silverado_2007()),
@@ -152,7 +179,10 @@ fn main() {
                 }
                 None => v,
             };
-            let (model, results, _) = run_barrier_test(&v, element_size, speed, 0.14, if gif.is_some() || vtk.is_some() { 20 } else { 0 });
+            let mut model = barrier_model(&v, element_size, speed, 0.14, if out.gif.is_some() || out.vtk.is_some() { 20 } else { 0 });
+            add_vehicle_accelerometer(&mut model, &v.name, &format!("{}_front", v.name));
+            out.configure(&mut model);
+            let results = crushrs::run(&model);
             let m = barrier_metrics_window(&model, &results, &v.name, 0, window);
             println!("{} elements, {} steps, {:.2?}", model.mesh.hexes.len(), results.steps, results.wall_time);
             println!("                 simulated   target");
@@ -162,9 +192,9 @@ fn main() {
             println!("mean force     {:8.0}    {:8.0} kN", m.mean_force / 1e3, 0.5 * v.mass * speed * speed / crush_pred / 1e3);
             println!("restitution    {:8.3}    0.03-0.20", m.restitution);
             println!("delta-v        {:8.2} m/s", m.delta_v);
-            outputs(&model, &results, &gif, &vtk, None);
+            outputs(&model, &results, &out, None);
         }
-        Cmd::Crash { truck_mph, car_mph, gif, vtk } => {
+        Cmd::Crash { truck_mph, car_mph, out } => {
             let truck = Vehicle::chevrolet_silverado_2007_tuned();
             let car = Vehicle::dodge_neon_1996_tuned();
             let h = Vehicle::TUNED_ELEMENT_SIZE;
@@ -178,9 +208,9 @@ fn main() {
             let n_face = model.mesh.face_set_nodes("neon_front").unwrap().len() as f64;
             model.add_contact_pair("silverado_front", "neon_front", 400.0 * car.curve.stiffness / n_face, 0.3);
             model.settings.end_time = 0.15;
-            if gif.is_some() || vtk.is_some() {
-                model.settings.frame_steps = 15;
-            }
+            add_vehicle_accelerometer(&mut model, "silverado", "silverado_front");
+            add_vehicle_accelerometer(&mut model, "neon", "neon_front");
+            out.configure(&mut model);
             let results = crushrs::run(&model);
             let (mt, dvt, vt) = part_delta_v(&model, &results, "silverado");
             let (mc, dvc, vc) = part_delta_v(&model, &results, "neon");
@@ -192,9 +222,9 @@ fn main() {
             println!("Silverado  {:+7.2} m/s {:+6.1} mph   {:4.0} mm   ({:+.2} m/s)", dvt[0], dvt[0] / MPH, crush_x(&model, &results, "silverado", "silverado_front", truck.size[0]) * 1e3, v_common - v_t0);
             println!("Neon       {:+7.2} m/s {:+6.1} mph   {:4.0} mm   ({:+.2} m/s)", dvc[0], dvc[0] / MPH, crush_x(&model, &results, "neon", "neon_front", car.size[0]) * 1e3, v_common - v_c0);
             println!("restitution e = {:.3};  momentum {:.0} -> {:.0} kg·m/s", (vc[0] - vt[0]) / (v_t0 - v_c0), mt * v_t0 + mc * v_c0, mt * vt[0] + mc * vc[0]);
-            outputs(&model, &results, &gif, &vtk, None);
+            outputs(&model, &results, &out, None);
         }
-        Cmd::Tbone { truck_mph, car_mph, offset, gif, vtk } => {
+        Cmd::Tbone { truck_mph, car_mph, offset, out } => {
             let truck = Vehicle::chevrolet_silverado_2007_tuned();
             let car = Vehicle::dodge_neon_1996_tuned();
             let side = car.side_profile();
@@ -211,9 +241,9 @@ fn main() {
             let n_face = model.mesh.face_set_nodes("neon_side").unwrap().len() as f64;
             model.add_contact_pair("silverado_front", "neon_side", 400.0 * side.curve.stiffness / n_face, 0.3);
             model.settings.end_time = 0.15;
-            if gif.is_some() || vtk.is_some() {
-                model.settings.frame_steps = 15;
-            }
+            add_vehicle_accelerometer(&mut model, "silverado", "silverado_front");
+            add_vehicle_accelerometer(&mut model, &side.name, "neon_side");
+            out.configure(&mut model);
             let results = crushrs::run(&model);
             let (mt, dvt, _) = part_delta_v(&model, &results, "silverado");
             let (mc, dvc, _) = part_delta_v(&model, &results, &side.name);
@@ -239,7 +269,7 @@ fn main() {
             println!("Silverado   {:+6.2} {:+6.2} m/s  {:+6.1} mph   ({:+.2} m/s)", dvt[0], dvt[1], (dvt[0] * dvt[0] + dvt[1] * dvt[1]).sqrt() / MPH, v_common - truck_mph * MPH);
             println!("Neon        {:+6.2} {:+6.2} m/s  {:+6.1} mph   ({:+.2} m/s)", dvc[0], dvc[1], (dvc[0] * dvc[0] + dvc[1] * dvc[1]).sqrt() / MPH, v_common);
             println!("Neon yaw rate {:+.2} rad/s ({:+.0} deg/s);  side intrusion: max {:.0} mm, mean under truck {:.0} mm", yaw, yaw.to_degrees(), max_intr * 1e3, mean_intr * 1e3);
-            outputs(&model, &results, &gif, &vtk, Some(Vector3::new(0.35, -0.55, 0.75)));
+            outputs(&model, &results, &out, Some(Vector3::new(0.35, -0.55, 0.75)));
         }
     }
 }

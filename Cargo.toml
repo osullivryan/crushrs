@@ -15,6 +15,7 @@ log = "0.4"
 env_logger = "0.11"
 gif = "0.13"
 clap = { version = "4.5", features = ["derive"] }
+parquet = { version = "60.0.0", default-features = false, features = ["snap"] }
 
 [profile.release]
 opt-level = 3
@@ -22,3 +23,6 @@ debug = 1
 
 [profile.dev]
 opt-level = 2
+
+[dev-dependencies]
+parquet = { version = "60", default-features = false }

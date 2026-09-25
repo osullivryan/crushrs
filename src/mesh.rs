@@ -165,6 +165,44 @@ impl Mesh {
     }
 
     /// Smallest edge length over all hexahedra.
+    /// Node nearest a point, optionally restricted to a part.
+    pub fn nearest_node(&self, at: [f64; 3], part: Option<usize>) -> usize {
+        let candidates: Vec<usize> = match part {
+            Some(p) => self.part_nodes(p),
+            None => (0..self.nodes.len()).collect(),
+        };
+        let d2 = |n: usize| (0..3).map(|d| (self.nodes[n][d] - at[d]).powi(2)).sum::<f64>();
+        candidates.into_iter().min_by(|a, b| d2(*a).partial_cmp(&d2(*b)).unwrap()).expect("mesh has no nodes")
+    }
+
+    /// Among the nodes of `part` within `radius` of `node` (excluding
+    /// `exclude`), the one whose direction from `node` is best aligned with
+    /// `dir`; returns it with the cosine of the alignment.
+    pub fn best_aligned_neighbour(&self, node: usize, dir: [f64; 3], radius: f64, part: Option<usize>, exclude: &[usize]) -> Option<(usize, f64)> {
+        let candidates: Vec<usize> = match part {
+            Some(p) => self.part_nodes(p),
+            None => (0..self.nodes.len()).collect(),
+        };
+        let o = self.nodes[node];
+        let dn = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+        let mut best: Option<(usize, f64)> = None;
+        for n in candidates {
+            if n == node || exclude.contains(&n) {
+                continue;
+            }
+            let r = [self.nodes[n][0] - o[0], self.nodes[n][1] - o[1], self.nodes[n][2] - o[2]];
+            let rn = (r[0] * r[0] + r[1] * r[1] + r[2] * r[2]).sqrt();
+            if rn > radius || rn == 0.0 {
+                continue;
+            }
+            let c = (r[0] * dir[0] + r[1] * dir[1] + r[2] * dir[2]) / (rn * dn);
+            if best.map_or(true, |(_, bc)| c > bc) {
+                best = Some((n, c));
+            }
+        }
+        best
+    }
+
     pub fn min_edge_length(&self) -> f64 {
         const EDGES: [[usize; 2]; 12] = [[0, 1], [1, 2], [2, 3], [3, 0], [4, 5], [5, 6], [6, 7], [7, 4], [0, 4], [1, 5], [2, 6], [3, 7]];
         let mut min = f64::INFINITY;

@@ -266,6 +266,41 @@ pub fn assign_vehicle(model: &mut Model, v: &Vehicle, heading: Heading, speed: f
     model.set_initial_velocity(&v.name, [vx, 0.0, 0.0]);
 }
 
+/// Add a rear-seat-style accelerometer to a vehicle part: at the quarter
+/// point from the rear (opposite the `front_face` set), lateral centre,
+/// 35% of the height, with a body-fixed frame. Named `<part>_rear`.
+pub fn add_vehicle_accelerometer(model: &mut Model, part: &str, front_face: &str) -> String {
+    let p = model.mesh.part_index(part).unwrap_or_else(|| panic!("no part '{}'", part));
+    let nodes = model.mesh.part_nodes(p);
+    let mut lo = [f64::MAX; 3];
+    let mut hi = [f64::MIN; 3];
+    for &n in &nodes {
+        for d in 0..3 {
+            lo[d] = lo[d].min(model.mesh.nodes[n][d]);
+            hi[d] = hi[d].max(model.mesh.nodes[n][d]);
+        }
+    }
+    let front = model.mesh.face_set_nodes(front_face).unwrap_or_else(|| panic!("no face set '{}'", front_face));
+    let mut c = [0.0; 3];
+    for &n in &front {
+        for d in 0..3 {
+            c[d] += model.mesh.nodes[n][d] / front.len() as f64;
+        }
+    }
+    let mut at = [0.5 * (lo[0] + hi[0]), 0.5 * (lo[1] + hi[1]), lo[2] + 0.35 * (hi[2] - lo[2])];
+    for d in 0..2 {
+        let len = hi[d] - lo[d];
+        if (c[d] - lo[d]).abs() < 1e-6 * len {
+            at[d] = hi[d] - 0.25 * len;
+        } else if (c[d] - hi[d]).abs() < 1e-6 * len {
+            at[d] = lo[d] + 0.25 * len;
+        }
+    }
+    let name = format!("{}_rear", part);
+    model.add_accelerometer_at(&name, part, at);
+    name
+}
+
 /// Rigid barrier: a fixed stiff block with its contact face at `x`. Creates
 /// part `<name>` and face set `<name>_face`.
 pub fn add_rigid_wall(mesh: &mut Mesh, name: &str, x: f64, y: [f64; 2], z: [f64; 2], facing: Heading, thickness: f64) -> usize {

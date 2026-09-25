@@ -144,3 +144,46 @@ fn vtk_series_is_written() {
     assert_eq!(pvd.matches("<DataSet").count(), r.frames.len());
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn accelerometer_history_integrates_to_delta_v() {
+    use crushrs::vehicle::add_vehicle_accelerometer;
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    let (mut model, _) = head_on(30.0, 30.0);
+    model.settings.end_time = 0.06;
+    model.settings.history_steps = 1;
+    let name = add_vehicle_accelerometer(&mut model, "neon", "neon_front");
+    let r = crushrs::run(&model);
+    let h = &r.node_history;
+    let idx: Vec<usize> = (0..h.time.len()).filter(|i| model.accelerometers[h.accelerometer[*i]].name == name).collect();
+    assert_eq!(idx.len(), r.steps + 1);
+    // ∫a dt over the samples equals the velocity change of the node.
+    let mut dv = 0.0;
+    for w in idx.windows(2) {
+        let (i, j) = (w[0], w[1]);
+        dv += 0.5 * (h.acceleration[i][0] + h.acceleration[j][0]) * (h.time[j] - h.time[i]);
+    }
+    let dv_node = h.velocity[*idx.last().unwrap()][0] - h.velocity[idx[0]][0];
+    assert!(dv_node > 3.0, "node should have slowed: {}", dv_node);
+    assert!((dv - dv_node).abs() < 0.02 * dv_node.abs(), "int a dt {} vs dv {}", dv, dv_node);
+    // The body-fixed frame starts aligned with the global axes and stays close in a head-on.
+    let f = &r.frame_history;
+    assert!((f.axes[0][0][0] - 1.0).abs() < 1e-9 && (f.axes[0][1][1] - 1.0).abs() < 1e-9);
+    let last = f.axes.last().unwrap();
+    assert!(last[0][0] > 0.99, "frame rotated too much: {:?}", last);
+    let i = *idx.last().unwrap();
+    let la = h.local_acceleration[i];
+    let a = h.acceleration[i];
+    let rot = [last[0][0] * a[0] + last[0][1] * a[1] + last[0][2] * a[2], last[1][0] * a[0] + last[1][1] * a[1] + last[1][2] * a[2], last[2][0] * a[0] + last[2][1] * a[1] + last[2][2] * a[2]];
+    assert!((0..3).all(|d| (la[d] - rot[d]).abs() < 1e-9));
+    // Parquet tables round-trip.
+    let dir = std::env::temp_dir().join(format!("crushrs_hist_{}", std::process::id()));
+    let paths = crushrs::output::history::write_history(&model, &r, &dir.join("run")).unwrap();
+    assert_eq!(paths.len(), 3);
+    let reader = SerializedFileReader::new(std::fs::File::open(&paths[0]).unwrap()).unwrap();
+    assert_eq!(reader.metadata().file_metadata().num_rows() as usize, h.time.len());
+    assert_eq!(reader.metadata().file_metadata().schema_descr().num_columns(), 25);
+    let reader = SerializedFileReader::new(std::fs::File::open(&paths[2]).unwrap()).unwrap();
+    assert_eq!(reader.metadata().file_metadata().num_rows() as usize, r.history.len() * model.mesh.parts.len());
+    std::fs::remove_dir_all(&dir).ok();
+}

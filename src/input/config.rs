@@ -32,18 +32,28 @@
 //! stiffness = 2e6
 //! max_distance = 0.3
 //!
+//! [[accelerometer]]                    # high-frequency nodal history
+//! name = "neon_rear"
+//! part = "neon"
+//! at = [3.3, 0.0, 0.5]                 # nearest node of the part, body-fixed frame from its neighbours
+//! # or explicit nodes and frame (0-based node indices):
+//! # nodes = [12, 13]
+//! # frame = { origin = 12, x_axis = 13, plane = 20 }
+//!
 //! [solver]
 //! end_time = 0.15
 //! frame_steps = 15
+//! history_steps = 1                    # sample accelerometers / parts every step
 //!
 //! [output]
 //! gif = "crash.gif"
 //! vtk = "out/crash"                    # writes out/crash.pvd + out/crash_NNNN.vtu
+//! history = "out/crash"                # writes out/crash.nodes/.frames/.parts.parquet
 //! ```
 
 use crate::material::Material;
 use crate::mesh::{BlockFace, Mesh};
-use crate::model::{Model, Settings};
+use crate::model::{LocalFrame, Model, Settings};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -58,6 +68,8 @@ pub struct Config {
     pub fixed: Vec<SetRef>,
     #[serde(default)]
     pub contact: Vec<ContactConfig>,
+    #[serde(default)]
+    pub accelerometer: Vec<AccelerometerConfig>,
     #[serde(default)]
     pub solver: Settings,
     #[serde(default)]
@@ -118,10 +130,25 @@ fn default_max_distance() -> f64 {
     0.3
 }
 
+/// Accelerometer: either `at` (+ `part`) for an auto frame at the nearest
+/// node, or explicit `nodes` / `set` with an optional `frame`.
+#[derive(Debug, Deserialize)]
+pub struct AccelerometerConfig {
+    pub name: String,
+    pub part: Option<String>,
+    pub at: Option<[f64; 3]>,
+    #[serde(default)]
+    pub nodes: Vec<usize>,
+    pub set: Option<String>,
+    pub frame: Option<LocalFrame>,
+}
+
 #[derive(Debug, Deserialize, Default)]
 pub struct Output {
     pub gif: Option<String>,
     pub vtk: Option<String>,
+    /// Base path for the Parquet history tables.
+    pub history: Option<String>,
 }
 
 fn parse_face(s: &str) -> Result<BlockFace, String> {
@@ -147,6 +174,14 @@ pub fn read_mesh(path: &Path) -> Result<Mesh, String> {
 }
 
 impl Config {
+    fn accelerometer_nodes(&self, a: &AccelerometerConfig, model: &Model) -> Result<Vec<usize>, String> {
+        let mut nodes = a.nodes.clone();
+        if let Some(set) = &a.set {
+            nodes.extend(model.mesh.nodes_of(set).ok_or_else(|| format!("accelerometer '{}': unknown set '{}'", a.name, set))?);
+        }
+        Ok(nodes)
+    }
+
     pub fn from_str(text: &str) -> Result<Self, String> {
         toml::from_str(text).map_err(|e| e.to_string())
     }
@@ -199,6 +234,35 @@ impl Config {
                 }
             }
             model.add_contact_pair(&c.a, &c.b, c.stiffness, c.max_distance);
+        }
+        for a in &self.accelerometer {
+            if let Some(at) = a.at {
+                let part = a.part.as_deref().ok_or_else(|| format!("accelerometer '{}': 'at' needs 'part'", a.name))?;
+                if model.mesh.part_index(part).is_none() {
+                    return Err(format!("accelerometer '{}': unknown part '{}'", a.name, part));
+                }
+                model.add_accelerometer_at(&a.name, part, at);
+                if !a.nodes.is_empty() || a.set.is_some() {
+                    let extra = self.accelerometer_nodes(a, &model)?;
+                    model.accelerometers.last_mut().unwrap().nodes.extend(extra);
+                }
+                if let Some(f) = a.frame {
+                    model.accelerometers.last_mut().unwrap().frame = Some(f);
+                }
+            } else {
+                let nodes = self.accelerometer_nodes(a, &model)?;
+                if nodes.is_empty() {
+                    return Err(format!("accelerometer '{}': give 'at', 'nodes' or 'set'", a.name));
+                }
+                model.add_accelerometer(&a.name, nodes, a.frame);
+            }
+            let n = model.mesh.nodes.len();
+            let acc = model.accelerometers.last().unwrap();
+            for m in acc.nodes.iter().copied().chain(acc.frame.iter().flat_map(|f| [f.origin, f.x_axis, f.plane])) {
+                if m >= n {
+                    return Err(format!("accelerometer '{}': node {} out of range (mesh has {} nodes)", a.name, m, n));
+                }
+            }
         }
         Ok(model)
     }

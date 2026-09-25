@@ -25,6 +25,39 @@ pub struct PartState {
     pub mass: f64,
     pub velocity: [f64; 3],
     pub displacement: [f64; 3],
+    /// Net force / mass.
+    pub acceleration: [f64; 3],
+    pub kinetic_energy: f64,
+}
+
+/// One accelerometer sample: a node's motion in global axes and, if the
+/// accelerometer has a frame, in that body-fixed frame (otherwise the local
+/// columns repeat the global ones).
+#[derive(Debug, Clone, Default)]
+pub struct NodeHistory {
+    pub time: Vec<f64>,
+    pub step: Vec<usize>,
+    /// Index into `Model::accelerometers`.
+    pub accelerometer: Vec<usize>,
+    pub node: Vec<usize>,
+    pub position: Vec<[f64; 3]>,
+    pub displacement: Vec<[f64; 3]>,
+    pub velocity: Vec<[f64; 3]>,
+    pub acceleration: Vec<[f64; 3]>,
+    pub local_displacement: Vec<[f64; 3]>,
+    pub local_velocity: Vec<[f64; 3]>,
+    pub local_acceleration: Vec<[f64; 3]>,
+}
+
+/// Body-fixed frame of an accelerometer at one time.
+#[derive(Debug, Clone, Default)]
+pub struct FrameHistory {
+    pub time: Vec<f64>,
+    pub step: Vec<usize>,
+    pub accelerometer: Vec<usize>,
+    pub origin: Vec<[f64; 3]>,
+    /// Local unit axes (rows) in global components.
+    pub axes: Vec<[[f64; 3]; 3]>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -37,6 +70,9 @@ pub struct Results {
     pub frames: Vec<Frame>,
     /// (time, per-part states) every `history_steps`.
     pub history: Vec<(f64, Vec<PartState>)>,
+    /// Accelerometer samples every `history_steps`.
+    pub node_history: NodeHistory,
+    pub frame_history: FrameHistory,
     pub eroded_elements: usize,
     pub wall_time: std::time::Duration,
     pub force_time: std::time::Duration,
@@ -75,24 +111,79 @@ impl Results {
     }
 }
 
-fn part_states(model: &Model, masses: &[f64], u: &[f64], v: &[f64]) -> Vec<PartState> {
-    (0..model.mesh.parts.len())
-        .map(|p| {
-            let nodes = model.mesh.part_nodes(p);
+fn part_states(part_nodes: &[Vec<usize>], masses: &[f64], u: &[f64], v: &[f64], a: &[f64]) -> Vec<PartState> {
+    part_nodes
+        .iter()
+        .enumerate()
+        .map(|(p, nodes)| {
             let mut m = 0.0;
             let mut mv = [0.0; 3];
             let mut mu = [0.0; 3];
-            for n in nodes {
+            let mut ma = [0.0; 3];
+            let mut ke = 0.0;
+            for &n in nodes {
                 m += masses[n];
                 for d in 0..3 {
                     mv[d] += masses[n] * v[3 * n + d];
                     mu[d] += masses[n] * u[3 * n + d];
+                    ma[d] += masses[n] * a[3 * n + d];
+                    ke += 0.5 * masses[n] * v[3 * n + d] * v[3 * n + d];
                 }
             }
             let inv = if m > 0.0 { 1.0 / m } else { 0.0 };
-            PartState { part: p, mass: m, velocity: [mv[0] * inv, mv[1] * inv, mv[2] * inv], displacement: [mu[0] * inv, mu[1] * inv, mu[2] * inv] }
+            PartState {
+                part: p,
+                mass: m,
+                velocity: [mv[0] * inv, mv[1] * inv, mv[2] * inv],
+                displacement: [mu[0] * inv, mu[1] * inv, mu[2] * inv],
+                acceleration: [ma[0] * inv, ma[1] * inv, ma[2] * inv],
+                kinetic_energy: ke,
+            }
         })
         .collect()
+}
+
+fn rotate(axes: &[[f64; 3]; 3], v: [f64; 3]) -> [f64; 3] {
+    std::array::from_fn(|i| axes[i][0] * v[0] + axes[i][1] * v[1] + axes[i][2] * v[2])
+}
+
+fn sample_accelerometers(model: &Model, t: f64, step: usize, u: &[f64], v: &[f64], a: &[f64], nodes: &mut NodeHistory, frames: &mut FrameHistory) {
+    let x = |n: usize| -> [f64; 3] { std::array::from_fn(|d| model.mesh.nodes[n][d] + u[3 * n + d]) };
+    let vec3 = |w: &[f64], n: usize| -> [f64; 3] { [w[3 * n], w[3 * n + 1], w[3 * n + 2]] };
+    for (k, acc) in model.accelerometers.iter().enumerate() {
+        let axes = acc.frame.map(|f| {
+            let axes = f.axes(x);
+            frames.time.push(t);
+            frames.step.push(step);
+            frames.accelerometer.push(k);
+            frames.origin.push(x(f.origin));
+            frames.axes.push(axes);
+            axes
+        });
+        for &n in &acc.nodes {
+            let (un, vn, an) = (vec3(u, n), vec3(v, n), vec3(a, n));
+            nodes.time.push(t);
+            nodes.step.push(step);
+            nodes.accelerometer.push(k);
+            nodes.node.push(n);
+            nodes.position.push(x(n));
+            nodes.displacement.push(un);
+            nodes.velocity.push(vn);
+            nodes.acceleration.push(an);
+            match &axes {
+                Some(r) => {
+                    nodes.local_displacement.push(rotate(r, un));
+                    nodes.local_velocity.push(rotate(r, vn));
+                    nodes.local_acceleration.push(rotate(r, an));
+                }
+                None => {
+                    nodes.local_displacement.push(un);
+                    nodes.local_velocity.push(vn);
+                    nodes.local_acceleration.push(an);
+                }
+            }
+        }
+    }
 }
 
 /// Run the explicit solve.
@@ -131,6 +222,13 @@ pub fn run(model: &Model) -> Results {
     let mut v_half = vec![0.0; n];
     let mut f_int = vec![0.0; n];
     let mut f_ext = vec![0.0; n];
+    let mut acc = vec![0.0; n];
+    let part_nodes: Vec<Vec<usize>> = (0..model.mesh.parts.len()).map(|p| model.mesh.part_nodes(p)).collect();
+    for (k, a) in model.accelerometers.iter().enumerate() {
+        for m in a.nodes.iter().copied().chain(a.frame.iter().flat_map(|f| [f.origin, f.x_axis, f.plane])) {
+            assert!(m < n_nodes, "accelerometer {} '{}': node {} out of range", k, a.name, m);
+        }
+    }
     let mut results = Results { masses: masses.clone(), ..Default::default() };
     let mut time_force = std::time::Duration::ZERO;
     let mut time_contact = std::time::Duration::ZERO;
@@ -138,6 +236,12 @@ pub fn run(model: &Model) -> Results {
     let t0 = std::time::Instant::now();
     elements.compute_forces(&u, &mut f_int, threads);
     time_force += t0.elapsed();
+    for c in &mut contacts {
+        c.apply(&model.mesh.nodes, &u, &mut f_ext);
+    }
+    for k in 0..n {
+        acc[k] = (f_ext[k] - f_int[k]) * inv_mass[k];
+    }
 
     let mut t = 0.0;
     let mut step = 0usize;
@@ -155,8 +259,12 @@ pub fn run(model: &Model) -> Results {
     if s.frame_steps > 0 {
         capture(&mut elements, &u, t, &mut results);
     }
+    let record = |t: f64, step: usize, u: &[f64], v: &[f64], acc: &[f64], results: &mut Results| {
+        results.history.push((t, part_states(&part_nodes, &masses, u, v, acc)));
+        sample_accelerometers(model, t, step, u, v, acc, &mut results.node_history, &mut results.frame_history);
+    };
     if s.history_steps > 0 {
-        results.history.push((t, part_states(model, &masses, &u, &v)));
+        record(t, 0, &u, &v, &acc, &mut results);
     }
     let mut dt_cfl = dt;
     while t < s.end_time {
@@ -202,9 +310,11 @@ pub fn run(model: &Model) -> Results {
         for k in 0..n {
             let a = (f_ext[k] - f_int[k]) * inv_mass[k];
             v[k] = (v_half[k] + 0.5 * dt * a) * s.velocity_damping;
+            acc[k] = a;
         }
         for &k in &fixed {
             v[k] = 0.0;
+            acc[k] = 0.0;
         }
 
         step += 1;
@@ -213,14 +323,14 @@ pub fn run(model: &Model) -> Results {
             capture(&mut elements, &u, t, &mut results);
         }
         if s.history_steps > 0 && step % s.history_steps == 0 {
-            results.history.push((t, part_states(model, &masses, &u, &v)));
+            record(t, step, &u, &v, &acc, &mut results);
         }
     }
     if s.frame_steps > 0 && step % s.frame_steps != 0 {
         capture(&mut elements, &u, t, &mut results);
     }
     if s.history_steps > 0 && step % s.history_steps != 0 {
-        results.history.push((t, part_states(model, &masses, &u, &v)));
+        record(t, step, &u, &v, &acc, &mut results);
     }
 
     results.time = t;

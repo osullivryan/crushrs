@@ -56,3 +56,19 @@ max_distance = 0.3
 [solver]
 end_time = 0.15        # s; the time step adapts to crushing elements
 frame_steps = 15       # capture a frame every 15 steps for GIF / VTK
+history_steps = 1      # sample accelerometers and parts every step
+
+# Rear-seat accelerometers (LS-DYNA *ELEMENT_SEATBELT_ACCELEROMETER style):
+# the part node nearest `at`, with a body-fixed frame from its neighbours.
+[[accelerometer]]
+name = "neon_rear"
+part = "neon"
+at = [3.3, 0.0, 0.5]
+
+[[accelerometer]]
+name = "silverado_rear"
+part = "silverado"
+at = [-4.4, 0.0, 0.6]
+
+[output]
+history = "out/crash"  # out/crash.nodes.parquet, .frames.parquet, .parts.parquet
