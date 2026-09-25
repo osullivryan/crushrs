@@ -166,6 +166,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 
 [[package]]
+name = "crushrs"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "env_logger",
+ "gif",
+ "log",
+ "nalgebra",
+ "rayon",
+ "serde",
+ "toml",
+]
+
+[[package]]
 name = "defmt"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -194,20 +208,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "10d60334b3b2e7c9d91ef8150abfb6fa4c1c39ebbcf4a81c2e346aad939fee3e"
 dependencies = [
  "thiserror",
-]
-
-[[package]]
-name = "deltav"
-version = "0.1.0"
-dependencies = [
- "clap",
- "env_logger",
- "gif",
- "log",
- "nalgebra",
- "rayon",
- "serde",
- "toml",
 ]
 
 [[package]]

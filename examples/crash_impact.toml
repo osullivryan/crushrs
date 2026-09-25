@@ -1,5 +1,5 @@
 # Head-on 2007 Chevrolet Silverado vs 1996 Dodge Neon at 30 mph each.
-#   deltav run examples/crash_impact.toml --gif crash.gif --vtk out/crash
+#   crushrs run examples/crash_impact.toml --gif crash.gif --vtk out/crash
 #
 # Each vehicle is a homogenised crushable honeycomb block (density = NHTSA test
 # mass / block volume), calibrated so a simulated 35 mph NCAP rigid-barrier

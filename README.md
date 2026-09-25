@@ -1,4 +1,4 @@
-# deltav
+# crushrs
 
 A fast explicit crash solver for estimating **delta-v** (the velocity change
 each vehicle experiences) in vehicle-to-vehicle impacts, given initial

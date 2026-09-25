@@ -1,10 +1,10 @@
 [package]
-name = "deltav"
+name = "crushrs"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "Fast explicit crash solver for delta-v estimation: crushable-vehicle blocks calibrated to NHTSA tests, one-point hex elements, SIMD kernel"
-repository = "https://github.com/osullivryan/deltav"
+repository = "https://github.com/osullivryan/crushrs"
 
 [dependencies]
 nalgebra = "0.33"

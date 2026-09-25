@@ -1,19 +1,19 @@
-//! deltav command line.
+//! crushrs command line.
 //!
-//!   deltav run model.toml                     # any TOML setup
-//!   deltav barrier neon [--calibrate N]       # NCAP-style barrier test vs NHTSA targets
-//!   deltav crash 30 30 --gif crash.gif        # Silverado vs Neon head-on
-//!   deltav tbone 30 0 -1.2 --vtk out/tbone    # Silverado into the Neon's side
+//!   crushrs run model.toml                     # any TOML setup
+//!   crushrs barrier neon [--calibrate N]       # NCAP-style barrier test vs NHTSA targets
+//!   crushrs crash 30 30 --gif crash.gif        # Silverado vs Neon head-on
+//!   crushrs tbone 30 0 -1.2 --vtk out/tbone    # Silverado into the Neon's side
 
 use clap::{Parser, Subcommand};
-use deltav::output::gif::{write_gif, GifOptions};
-use deltav::vehicle::{add_vehicle, assign_vehicle, barrier_metrics_window, calibrate, run_barrier_test, BarrierTargets, Heading, Vehicle};
-use deltav::{BlockFace, Mesh, Model, Results, MPH};
+use crushrs::output::gif::{write_gif, GifOptions};
+use crushrs::vehicle::{add_vehicle, assign_vehicle, barrier_metrics_window, calibrate, run_barrier_test, BarrierTargets, Heading, Vehicle};
+use crushrs::{BlockFace, Mesh, Model, Results, MPH};
 use nalgebra::Vector3;
 use std::path::Path;
 
 #[derive(Parser)]
-#[command(name = "deltav", about = "Fast explicit crash solver for delta-v estimation")]
+#[command(name = "crushrs", about = "Fast explicit crash solver for delta-v estimation")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -81,7 +81,7 @@ fn outputs(model: &Model, results: &Results, gif: &Option<String>, vtk: &Option<
         println!("wrote {}", path);
     }
     if let Some(base) = vtk {
-        deltav::output::vtk::write_series(&model.mesh, &results.frames, Path::new(base)).expect("write vtk");
+        crushrs::output::vtk::write_series(&model.mesh, &results.frames, Path::new(base)).expect("write vtk");
         println!("wrote {}.pvd ({} frames)", base, results.frames.len());
     }
 }
@@ -111,14 +111,14 @@ fn main() {
     match Cli::parse().cmd {
         Cmd::Run { file, gif, vtk } => {
             let path = Path::new(&file);
-            let cfg = deltav::input::config::Config::load(path).unwrap_or_else(|e| panic!("{}", e));
+            let cfg = crushrs::input::config::Config::load(path).unwrap_or_else(|e| panic!("{}", e));
             let mut model = cfg.build(path.parent().unwrap_or(Path::new("."))).unwrap_or_else(|e| panic!("{}", e));
             let gif = gif.or(cfg.output.gif.clone());
             let vtk = vtk.or(cfg.output.vtk.clone());
             if (gif.is_some() || vtk.is_some()) && model.settings.frame_steps == 0 {
                 model.settings.frame_steps = 15;
             }
-            let results = deltav::run(&model);
+            let results = crushrs::run(&model);
             println!("{} elements, {} steps, {:.2?} ({:.0} ms simulated)", model.mesh.hexes.len(), results.steps, results.wall_time, results.time * 1e3);
             for (p, part) in model.mesh.parts.iter().enumerate() {
                 let (m, dv, _) = part_delta_v(&model, &results, &part.name);
@@ -181,7 +181,7 @@ fn main() {
             if gif.is_some() || vtk.is_some() {
                 model.settings.frame_steps = 15;
             }
-            let results = deltav::run(&model);
+            let results = crushrs::run(&model);
             let (mt, dvt, vt) = part_delta_v(&model, &results, "silverado");
             let (mc, dvc, vc) = part_delta_v(&model, &results, "neon");
             let (v_t0, v_c0) = (truck_mph * MPH, -car_mph * MPH);
@@ -214,7 +214,7 @@ fn main() {
             if gif.is_some() || vtk.is_some() {
                 model.settings.frame_steps = 15;
             }
-            let results = deltav::run(&model);
+            let results = crushrs::run(&model);
             let (mt, dvt, _) = part_delta_v(&model, &results, "silverado");
             let (mc, dvc, _) = part_delta_v(&model, &results, &side.name);
             let car_nodes = model.mesh.nodes_of(&side.name).unwrap();

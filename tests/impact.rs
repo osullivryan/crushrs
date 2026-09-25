@@ -2,11 +2,11 @@
 //! head-on crash, the tuned Neon reproducing its NHTSA barrier numbers, and
 //! the TOML path matching the Rust API.
 
-use deltav::input::config::Config;
-use deltav::vehicle::{add_vehicle, assign_vehicle, run_barrier_test, Heading, Vehicle};
-use deltav::{Mesh, Model, MPH};
+use crushrs::input::config::Config;
+use crushrs::vehicle::{add_vehicle, assign_vehicle, run_barrier_test, Heading, Vehicle};
+use crushrs::{Mesh, Model, MPH};
 
-fn head_on(truck_mph: f64, car_mph: f64) -> (Model, deltav::Results) {
+fn head_on(truck_mph: f64, car_mph: f64) -> (Model, crushrs::Results) {
     let truck = Vehicle::chevrolet_silverado_2007_tuned();
     let car = Vehicle::dodge_neon_1996_tuned();
     let mut mesh = Mesh::new();
@@ -18,11 +18,11 @@ fn head_on(truck_mph: f64, car_mph: f64) -> (Model, deltav::Results) {
     let n_face = model.mesh.face_set_nodes("neon_front").unwrap().len() as f64;
     model.add_contact_pair("silverado_front", "neon_front", 400.0 * car.curve.stiffness / n_face, 0.3);
     model.settings.end_time = 0.15;
-    let results = deltav::run(&model);
+    let results = crushrs::run(&model);
     (model, results)
 }
 
-fn delta_v(model: &Model, r: &deltav::Results, part: &str) -> (f64, f64) {
+fn delta_v(model: &Model, r: &crushrs::Results, part: &str) -> (f64, f64) {
     let nodes = model.mesh.nodes_of(part).unwrap();
     let (m, v1) = r.mean_velocity(&nodes);
     let (_, v0) = Model::mean_velocity(&r.masses, &model.initial_velocity, &nodes);
@@ -124,7 +124,7 @@ end_time = 0.15
     );
     let cfg = Config::from_str(&toml).unwrap();
     let model = cfg.build(std::path::Path::new(".")).unwrap();
-    let r = deltav::run(&model);
+    let r = crushrs::run(&model);
     let (_, dv_toml) = delta_v(&model, &r, "neon");
     let (_, dv_api) = delta_v(&model_api, &r_api, "neon");
     assert!((dv_toml - dv_api).abs() < 1e-3 * dv_api.abs(), "toml {} vs api {}", dv_toml, dv_api);
@@ -135,9 +135,9 @@ fn vtk_series_is_written() {
     let (mut model, _) = head_on(30.0, 30.0);
     model.settings.end_time = 0.02;
     model.settings.frame_steps = 20;
-    let r = deltav::run(&model);
+    let r = crushrs::run(&model);
     let dir = std::env::temp_dir().join(format!("deltav_vtk_{}", std::process::id()));
-    deltav::output::vtk::write_series(&model.mesh, &r.frames, &dir.join("crash")).unwrap();
+    crushrs::output::vtk::write_series(&model.mesh, &r.frames, &dir.join("crash")).unwrap();
     assert!(dir.join("crash.pvd").exists());
     assert!(dir.join("crash_0000.vtu").exists());
     let pvd = std::fs::read_to_string(dir.join("crash.pvd")).unwrap();

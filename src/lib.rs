@@ -1,4 +1,4 @@
-//! deltav: a fast explicit crash solver for delta-v estimation.
+//! crushrs: a fast explicit crash solver for vehicle delta-v estimation.
 //!
 //! Vehicles are homogenised crushable blocks of one-point hexahedra with a
 //! corotational honeycomb material, calibrated so a simulated NHTSA rigid-
