@@ -110,6 +110,12 @@ impl Mesh {
     /// registered as a node set with the part's name.
     pub fn add_hex_block(&mut self, part_name: &str, origin: [f64; 3], size: [f64; 3], element_size: f64, surfaces: &[(BlockFace, &str)]) -> usize {
         let n: [usize; 3] = std::array::from_fn(|a| (size[a] / element_size).round().max(1.0) as usize);
+        self.add_hex_block_n(part_name, origin, size, n, surfaces)
+    }
+
+    /// [`add_hex_block`] with an explicit number of elements per axis.
+    pub fn add_hex_block_n(&mut self, part_name: &str, origin: [f64; 3], size: [f64; 3], n: [usize; 3], surfaces: &[(BlockFace, &str)]) -> usize {
+        let n: [usize; 3] = std::array::from_fn(|a| n[a].max(1));
         let d: [f64; 3] = std::array::from_fn(|a| size[a] / n[a] as f64);
         let node0 = self.nodes.len();
         let id = |ijk: [usize; 3]| node0 + ijk[0] + (n[0] + 1) * (ijk[1] + (n[1] + 1) * ijk[2]);
@@ -164,7 +170,85 @@ impl Mesh {
         part
     }
 
-    /// Smallest edge length over all hexahedra.
+    /// Merge nodes closer than `tol` (e.g. the shared face of two blocks
+    /// built with matching grids), keeping the lowest index. Connectivity,
+    /// faces and node sets are remapped; sets are deduplicated.
+    pub fn merge_coincident_nodes(&mut self, tol: f64) -> usize {
+        use std::collections::HashMap;
+        let key = |p: &[f64; 3]| -> [i64; 3] { std::array::from_fn(|d| (p[d] / tol).round() as i64) };
+        let mut first: HashMap<[i64; 3], usize> = HashMap::new();
+        let mut map = vec![0usize; self.nodes.len()];
+        let mut kept: Vec<[f64; 3]> = Vec::with_capacity(self.nodes.len());
+        let mut merged = 0;
+        for (i, p) in self.nodes.iter().enumerate() {
+            let k = key(p);
+            // Check the cell and its neighbours so points straddling a
+            // rounding boundary still merge.
+            let mut found = None;
+            'outer: for dx in -1..=1 {
+                for dy in -1..=1 {
+                    for dz in -1..=1 {
+                        if let Some(&j) = first.get(&[k[0] + dx, k[1] + dy, k[2] + dz]) {
+                            let q = kept[j];
+                            if (0..3).all(|d| (q[d] - p[d]).abs() <= tol) {
+                                found = Some(j);
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+            }
+            match found {
+                Some(j) => {
+                    map[i] = j;
+                    merged += 1;
+                }
+                None => {
+                    map[i] = kept.len();
+                    first.insert(k, kept.len());
+                    kept.push(*p);
+                }
+            }
+        }
+        if merged == 0 {
+            return 0;
+        }
+        self.nodes = kept;
+        for h in &mut self.hexes {
+            for n in h.iter_mut() {
+                *n = map[*n];
+            }
+        }
+        for f in &mut self.faces {
+            for n in f.iter_mut() {
+                *n = map[*n];
+            }
+        }
+        for set in self.node_sets.values_mut() {
+            let mut v: Vec<usize> = set.iter().map(|n| map[*n]).collect();
+            v.sort_unstable();
+            v.dedup();
+            *set = v;
+        }
+        merged
+    }
+
+    /// Shortest edge incident to `node` (∞ if the node is unused).
+    pub fn min_edge_at(&self, node: usize) -> f64 {
+        const EDGES: [[usize; 2]; 12] = [[0, 1], [1, 2], [2, 3], [3, 0], [4, 5], [5, 6], [6, 7], [7, 4], [0, 4], [1, 5], [2, 6], [3, 7]];
+        let mut min = f64::INFINITY;
+        for h in self.hexes.iter().filter(|h| h.contains(&node)) {
+            for [a, b] in EDGES {
+                if h[a] == node || h[b] == node {
+                    let (p, q) = (self.nodes[h[a]], self.nodes[h[b]]);
+                    let d = ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)).sqrt();
+                    min = min.min(d);
+                }
+            }
+        }
+        min
+    }
+
     /// Node nearest a point, optionally restricted to a part.
     pub fn nearest_node(&self, at: [f64; 3], part: Option<usize>) -> usize {
         let candidates: Vec<usize> = match part {

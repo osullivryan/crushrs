@@ -35,9 +35,13 @@ pub enum PlasticModel {
     Honeycomb,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+/// Maximum knots of a tabulated yield curve.
+pub const MAX_KNOTS: usize = 8;
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct Plasticity {
-    /// Initial yield stress σ_y (Pa).
+    /// Initial yield stress σ_y (Pa). Optional when `curve` is given.
+    #[serde(default)]
     pub yield_stress: f64,
     /// Linear hardening modulus H (Pa): σ_y(ε̄ᵖ) = σ_y + H·ε̄ᵖ, ε̄ᵖ the
     /// equivalent plastic strain (J2) or compaction (foam, honeycomb).
@@ -45,9 +49,96 @@ pub struct Plasticity {
     pub hardening: f64,
     #[serde(default)]
     pub model: PlasticModel,
+    /// Tabulated yield stress vs compaction `[[c, σ_y], ...]` (honeycomb
+    /// only; up to [`MAX_KNOTS`] knots, c ascending from 0). Piecewise
+    /// linear, the last segment's slope continues beyond the table. When
+    /// set it replaces `yield_stress` / `hardening`, which are kept equal
+    /// to the first knot and first slope for reporting.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub curve: Vec<[f64; 2]>,
+    /// Densification (lock-up) for the honeycomb model: `[c_lock, k_lock]`
+    /// adds `k_lock·(c − c_lock)` to the yield stress beyond compaction
+    /// `c_lock`, so a fully crushed element stiffens instead of inverting.
+    /// Uses one of the [`MAX_KNOTS`] knots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub densification: Option<[f64; 2]>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+impl Plasticity {
+    /// Yield stress and local hardening slope at compaction `c`.
+    #[inline]
+    pub fn yield_at(&self, c: f64) -> (f64, f64) {
+        let (mut sy, mut h) = if self.curve.len() < 2 {
+            (self.yield_stress + self.hardening * c, self.hardening)
+        } else {
+            let k = &self.curve;
+            let mut i = 0;
+            while i + 2 < k.len() && c >= k[i + 1][0] {
+                i += 1;
+            }
+            let h = (k[i + 1][1] - k[i][1]) / (k[i + 1][0] - k[i][0]);
+            (k[i][1] + h * (c - k[i][0]), h)
+        };
+        if let Some([c_lock, k_lock]) = self.densification {
+            if c > c_lock {
+                sy += k_lock * (c - c_lock);
+                h += k_lock;
+            }
+        }
+        (sy, h)
+    }
+
+    /// Validate, and with a tabulated curve set `yield_stress` /
+    /// `hardening` to its first knot and slope (for reporting).
+    pub fn normalise(&mut self) -> Result<(), String> {
+        self.check()?;
+        if self.curve.len() >= 2 {
+            self.yield_stress = self.curve[0][1];
+            self.hardening = (self.curve[1][1] - self.curve[0][1]) / (self.curve[1][0] - self.curve[0][0]);
+        }
+        Ok(())
+    }
+
+    /// Validate a tabulated curve.
+    pub fn check(&self) -> Result<(), String> {
+        let k = &self.curve;
+        let extra = usize::from(self.densification.is_some());
+        if let Some([c_lock, k_lock]) = self.densification {
+            if self.model != PlasticModel::Honeycomb {
+                return Err("densification is only supported by the honeycomb model".into());
+            }
+            if c_lock <= 0.0 || k_lock < 0.0 {
+                return Err("densification needs c_lock > 0 and k_lock >= 0".into());
+            }
+            if k.last().map_or(false, |p| p[0] >= c_lock) {
+                return Err("densification c_lock must lie beyond the last curve knot".into());
+            }
+        }
+        if k.is_empty() {
+            return Ok(());
+        }
+        if self.model != PlasticModel::Honeycomb {
+            return Err("tabulated yield curve is only supported by the honeycomb model".into());
+        }
+        if k.len() < 2 || k.len() + extra > MAX_KNOTS {
+            return Err(format!("yield curve needs 2..={} knots (one fewer with densification)", MAX_KNOTS));
+        }
+        if k[0][0] != 0.0 {
+            return Err("yield curve must start at compaction 0".into());
+        }
+        for w in k.windows(2) {
+            if w[1][0] <= w[0][0] {
+                return Err("yield curve compaction must be strictly increasing".into());
+            }
+        }
+        if k.iter().any(|p| p[1] <= 0.0) {
+            return Err("yield curve stresses must be positive".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct Material {
     pub youngs_modulus: f64,
     #[serde(default)]
@@ -63,17 +154,26 @@ impl Material {
     }
 
     pub fn j2(youngs_modulus: f64, poisson_ratio: f64, density: f64, yield_stress: f64, hardening: f64) -> Self {
-        Material { youngs_modulus, poisson_ratio, density, plasticity: Some(Plasticity { yield_stress, hardening, model: PlasticModel::J2 }) }
+        Material { youngs_modulus, poisson_ratio, density, plasticity: Some(Plasticity { yield_stress, hardening, model: PlasticModel::J2, curve: Vec::new(), densification: None }) }
     }
 
     /// Isotropic crushable foam (elastic Poisson ratio treated as 0).
     pub fn crushable_foam(youngs_modulus: f64, density: f64, yield_stress: f64, hardening: f64) -> Self {
-        Material { youngs_modulus, poisson_ratio: 0.0, density, plasticity: Some(Plasticity { yield_stress, hardening, model: PlasticModel::CrushableFoam }) }
+        Material { youngs_modulus, poisson_ratio: 0.0, density, plasticity: Some(Plasticity { yield_stress, hardening, model: PlasticModel::CrushableFoam, curve: Vec::new(), densification: None }) }
     }
 
     /// Crushable honeycomb, corotational rate form (the SIMD kernel model).
     pub fn honeycomb(youngs_modulus: f64, density: f64, yield_stress: f64, hardening: f64) -> Self {
-        Material { youngs_modulus, poisson_ratio: 0.0, density, plasticity: Some(Plasticity { yield_stress, hardening, model: PlasticModel::Honeycomb }) }
+        Material { youngs_modulus, poisson_ratio: 0.0, density, plasticity: Some(Plasticity { yield_stress, hardening, model: PlasticModel::Honeycomb, curve: Vec::new(), densification: None }) }
+    }
+
+    /// Crushable honeycomb with a tabulated yield stress vs compaction
+    /// curve `[[c, σ_y], ...]` (see [`Plasticity::curve`]) and optional
+    /// densification `[c_lock, k_lock]` (see [`Plasticity::densification`]).
+    pub fn honeycomb_curve(youngs_modulus: f64, density: f64, curve: Vec<[f64; 2]>, densification: Option<[f64; 2]>) -> Self {
+        let p = Plasticity { yield_stress: curve[0][1], hardening: (curve[1][1] - curve[0][1]) / (curve[1][0] - curve[0][0]), model: PlasticModel::Honeycomb, curve, densification };
+        p.check().unwrap_or_else(|e| panic!("{}", e));
+        Material { youngs_modulus, poisson_ratio: 0.0, density, plasticity: Some(p) }
     }
 
     pub fn is_plastic(&self) -> bool {
@@ -81,7 +181,7 @@ impl Material {
     }
 
     pub fn model(&self) -> Option<PlasticModel> {
-        self.plasticity.map(|p| p.model)
+        self.plasticity.as_ref().map(|p| p.model)
     }
 
     pub fn shear_modulus(&self) -> f64 {
@@ -135,7 +235,7 @@ fn tensor_norm(s: &Voigt) -> f64 {
 pub fn radial_return(material: &Material, strain: &Voigt, state: &PlasticPoint) -> (Voigt, PlasticPoint) {
     let c = &material.elastic_matrix();
     let trial = c * (strain - state.plastic_strain);
-    let Some(p) = material.plasticity else {
+    let Some(p) = material.plasticity.as_ref() else {
         return (trial, *state);
     };
 
@@ -188,7 +288,7 @@ pub fn radial_return(material: &Material, strain: &Voigt, state: &PlasticPoint) 
 /// crushing), which drives the hardening.
 fn crushable_foam_return(
     e: f64,
-    p: Plasticity,
+    p: &Plasticity,
     f: &Matrix3<f64>,
     eps_trial: &[f64; 3],
     eigenvectors: &Matrix3<f64>,
@@ -279,18 +379,55 @@ pub fn honeycomb_rate_return(material: &Material, f: &Matrix3<f64>, state: &Rate
     honeycomb_rate_update(&HoneycombParams::from_material(material), f, state)
 }
 
-/// Compact parameters of the honeycomb model, for hot loops.
+/// Compact parameters of the honeycomb model, for hot loops: the yield
+/// curve as `knots` (compaction, stress, slope of the following segment),
+/// with unused knots at +∞ compaction.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HoneycombParams {
     pub youngs_modulus: f64,
     pub yield_stress: f64,
     pub hardening: f64,
+    pub knots: [[f64; 3]; MAX_KNOTS],
 }
 
 impl HoneycombParams {
     pub fn from_material(material: &Material) -> Self {
-        let p = material.plasticity.expect("honeycomb material");
-        HoneycombParams { youngs_modulus: material.youngs_modulus, yield_stress: p.yield_stress, hardening: p.hardening }
+        let p = material.plasticity.as_ref().expect("honeycomb material");
+        p.check().unwrap_or_else(|e| panic!("{}", e));
+        let mut knots = [[f64::INFINITY, 0.0, 0.0]; MAX_KNOTS];
+        let n = if p.curve.len() < 2 {
+            knots[0] = [0.0, p.yield_stress, p.hardening];
+            1
+        } else {
+            for (i, k) in p.curve.iter().enumerate() {
+                let h = if i + 1 < p.curve.len() { (p.curve[i + 1][1] - k[1]) / (p.curve[i + 1][0] - k[0]) } else { knots[i - 1][2] };
+                knots[i] = [k[0], k[1], h];
+            }
+            p.curve.len()
+        };
+        if let Some([c_lock, k_lock]) = p.densification {
+            let last = knots[n - 1];
+            knots[n] = [c_lock, last[1] + last[2] * (c_lock - last[0]), last[2] + k_lock];
+        }
+        HoneycombParams { youngs_modulus: material.youngs_modulus, yield_stress: p.yield_stress, hardening: p.hardening, knots }
+    }
+
+    pub fn new(youngs_modulus: f64, yield_stress: f64, hardening: f64) -> Self {
+        let mut knots = [[f64::INFINITY, 0.0, 0.0]; MAX_KNOTS];
+        knots[0] = [0.0, yield_stress, hardening];
+        HoneycombParams { youngs_modulus, yield_stress, hardening, knots }
+    }
+
+    /// Yield stress and local slope at compaction `c` (branch-free scan).
+    #[inline]
+    pub fn yield_at(&self, c: f64) -> (f64, f64) {
+        let mut k = self.knots[0];
+        for i in 1..MAX_KNOTS {
+            if c >= self.knots[i][0] {
+                k = self.knots[i];
+            }
+        }
+        (k[1] + k[2] * (c - k[0]), k[2])
     }
 }
 
@@ -322,25 +459,27 @@ pub fn honeycomb_rate_update(prm: &HoneycombParams, f: &Matrix3<f64>, state: &Ra
 
     // Cap the normal stresses with implicit hardening: for the active set A,
     // Δc·E = Σ_A (|σ_i| − σ_y0 − H c − H Δc)  ⇒  Δc = Σ_A(|σ_i| − σ_yc) / (E + |A|·H).
-    let sigma_yc = p.yield_stress + p.hardening * state.compaction;
+    let (sigma_yc, hard) = p.yield_at(state.compaction);
     let mut dc = 0.0;
     for _ in 0..3 {
-        let sigma_y = sigma_yc + p.hardening * dc;
+        let sigma_y = sigma_yc + hard * dc;
         let (mut sum, mut n_active) = (0.0, 0usize);
         for k in 0..3 {
-            if s[k].abs() > sigma_y {
-                sum += s[k].abs() - sigma_yc;
+            // Only compression compacts (and hardens); tension is just
+            // capped at +σ_y below.
+            if -s[k] > sigma_y {
+                sum += -s[k] - sigma_yc;
                 n_active += 1;
             }
         }
-        let dc_new = if n_active == 0 { 0.0 } else { sum / (e + n_active as f64 * p.hardening) };
+        let dc_new = if n_active == 0 { 0.0 } else { sum / (e + n_active as f64 * hard) };
         if (dc_new - dc).abs() <= 1e-14 * dc_new.max(1e-300) {
             dc = dc_new;
             break;
         }
         dc = dc_new;
     }
-    let sigma_y = sigma_yc + p.hardening * dc;
+    let sigma_y = (sigma_yc + hard * dc).max(0.0);
     for k in 0..3 {
         s[k] = s[k].clamp(-sigma_y, sigma_y);
     }
@@ -547,7 +686,7 @@ pub fn finite_strain_return(
         eps[a] = 0.5 * eigenvalues[a].max(1e-300).ln();
     }
 
-    if let Some(p) = material.plasticity.filter(|p| p.model == PlasticModel::CrushableFoam) {
+    if let Some(p) = material.plasticity.as_ref().filter(|p| p.model == PlasticModel::CrushableFoam) {
         return crushable_foam_return(e, p, f, &eps, &eigenvectors, state);
     }
 
@@ -556,7 +695,7 @@ pub fn finite_strain_return(
     let pressure = k * vol;
     let mut eq = state.eq_plastic_strain;
 
-    if let Some(p) = material.plasticity {
+    if let Some(p) = material.plasticity.as_ref() {
         let dev_norm = (dev[0] * dev[0] + dev[1] * dev[1] + dev[2] * dev[2]).sqrt();
         let q = (1.5_f64).sqrt() * 2.0 * g * dev_norm; // von Mises of trial τ
         let fy = q - (p.yield_stress + p.hardening * eq);

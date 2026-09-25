@@ -113,12 +113,12 @@ end_time = 0.15
 "#,
         te = model_api.materials[0].youngs_modulus,
         td = model_api.materials[0].density,
-        ty = model_api.materials[0].plasticity.unwrap().yield_stress,
-        th = model_api.materials[0].plasticity.unwrap().hardening,
+        ty = model_api.materials[0].plasticity.as_ref().unwrap().yield_stress,
+        th = model_api.materials[0].plasticity.as_ref().unwrap().hardening,
         ce = model_api.materials[1].youngs_modulus,
         cd = model_api.materials[1].density,
-        cy = model_api.materials[1].plasticity.unwrap().yield_stress,
-        ch = model_api.materials[1].plasticity.unwrap().hardening,
+        cy = model_api.materials[1].plasticity.as_ref().unwrap().yield_stress,
+        ch = model_api.materials[1].plasticity.as_ref().unwrap().hardening,
         v = 30.0 * MPH,
         k = model_api.contacts[0].stiffness,
     );
@@ -186,4 +186,60 @@ fn accelerometer_history_integrates_to_delta_v() {
     let reader = SerializedFileReader::new(std::fs::File::open(&paths[2]).unwrap()).unwrap();
     assert_eq!(reader.metadata().file_metadata().num_rows() as usize, r.history.len() * model.mesh.parts.len());
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn pulse_calibrated_neon_matches_nhtsa_test_2320() {
+    use crushrs::signal::Pulse;
+    use crushrs::vehicle::{run_barrier_pulse, PulseComparison, PULSE_DT, PULSE_END};
+    let measured = Pulse::read_nhtsa_tsv(std::path::Path::new("data/nhtsa/v02320tsv.078"), true).unwrap();
+    let meas = measured.filtered(60.0).resampled(PULSE_DT).truncated(PULSE_END);
+    let v = Vehicle::dodge_neon_1996_pulse();
+    let speed = 35.0 * MPH;
+    let (_, _, sim) = run_barrier_pulse(&v, Vehicle::TUNED_ELEMENT_SIZE, speed, 0);
+    let cmp = PulseComparison::new(&meas, &sim, v.mass, speed);
+    // Delta-v (impact speed + rebound) within 5 %, peak within 20 %, crush within 15 %.
+    let dv_meas = speed - cmp.v_meas.last().unwrap();
+    let dv_sim = speed - cmp.v_sim.last().unwrap();
+    assert!((dv_sim - dv_meas).abs() < 0.05 * dv_meas, "delta-v {} vs {}", dv_sim, dv_meas);
+    assert!((cmp.sim.peak_accel / cmp.meas.peak_accel - 1.0).abs() < 0.2, "peak {} vs {}", cmp.sim.peak_accel, cmp.meas.peak_accel);
+    assert!((cmp.sim.max_crush / cmp.meas.max_crush - 1.0).abs() < 0.15, "crush {} vs {}", cmp.sim.max_crush, cmp.meas.max_crush);
+    assert!(cmp.rms_accel_error() < 8.0 * 9.81, "rms {}", cmp.rms_accel_error());
+    // Velocity history within 1.5 m/s throughout.
+    let worst = cmp.v_meas.iter().zip(&cmp.v_sim).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+    assert!(worst < 1.5, "velocity error {}", worst);
+}
+
+#[test]
+fn tabulated_curve_round_trips_through_toml() {
+    let toml = r#"
+[[mesh.block]]
+part = "foam"
+origin = [0.0, 0.0, 0.0]
+size = [0.3, 0.3, 0.3]
+element_size = 0.3
+faces = [{ face = "x_max", set = "top" }]
+
+[[material]]
+part = "foam"
+youngs_modulus = 23.1e6
+density = 100.0
+model = "honeycomb"
+curve = [[0.0, 7000.0], [0.2, 9000.0], [0.5, 30000.0]]
+densification = [1.4, 7.0e6]
+
+[solver]
+end_time = 0.001
+"#;
+    let cfg = Config::from_str(toml).unwrap();
+    let model = cfg.build(std::path::Path::new(".")).unwrap();
+    let p = model.materials[0].plasticity.as_ref().unwrap();
+    assert_eq!(p.curve.len(), 3);
+    assert_eq!(p.densification, Some([1.4, 7.0e6]));
+    assert_eq!(p.yield_stress, 7000.0);
+    assert!((p.hardening - 10000.0).abs() < 1e-9);
+    assert!((p.yield_at(0.1).0 - 8000.0).abs() < 1e-9);
+    // Last slope (70 kPa per unit compaction) continues, plus densification beyond 1.4.
+    assert!((p.yield_at(2.0).0 - (30000.0 + 1.5 * 70000.0 + 0.6 * 7.0e6)).abs() < 1e-6);
+    let _ = crushrs::run(&model);
 }

@@ -5,7 +5,7 @@
 //! (`kernel_simd`) when enabled; everything else (and the honeycomb scalar
 //! reference) runs through the per-element f64 path here.
 
-use crate::element::{characteristic_length, HexGeometry};
+use crate::element::{characteristic_length_and_volume, HexGeometry};
 use crate::material::{finite_strain_return, honeycomb_rate_update, FinitePlasticPoint, HoneycombParams, Material, PlasticModel, RateFoamState};
 use crate::model::Model;
 use nalgebra::{Matrix3, SMatrix, SVector, Vector3};
@@ -55,7 +55,7 @@ impl Elements {
         let mut el = Elements::default();
         el.positions = mesh.nodes.clone();
         for (e, h) in mesh.hexes.iter().enumerate() {
-            let mat = model.materials[mesh.hex_part[e]];
+            let mat = model.materials[mesh.hex_part[e]].clone();
             let x = SMatrix::<f64, 8, 3>::from_fn(|i, d| mesh.nodes[h[i]][d]);
             let geo = HexGeometry::new(&x, &mat, model.settings.hourglass);
             el.conn.push(std::array::from_fn(|i| h[i] as u32));
@@ -69,7 +69,7 @@ impl Elements {
             el.volume.push(geo.volume);
             el.gamma.push(geo.hourglass.gamma);
             el.h.push(geo.hourglass.h);
-            el.material.push(mat);
+            el.material.push(mat.clone());
             el.dt_factor.push((1.0 - 0.36 * mat.poisson_ratio) / mat.dilatational_wave_speed());
             el.state.push(match mat.model() {
                 Some(PlasticModel::Honeycomb) => State::Rate(RateFoamState::default()),
@@ -214,8 +214,13 @@ impl Elements {
                 let n = conn[i] as usize;
                 Vector3::new(self.positions[n][0] + u[3 * n], self.positions[n][1] + u[3 * n + 1], self.positions[n][2] + u[3 * n + 2])
             });
-            let l = characteristic_length(&p);
-            if l.is_finite() {
+            // dt = L / c₀ with the current characteristic length V/A_max.
+            // (Using the current density, c = c₀·√J, would allow
+            // L/√J — up to 2× larger for heavily crushed elements — but
+            // proved marginal for locked-up honeycomb, so the initial wave
+            // speed is kept: conservative for crushed elements.)
+            let (l, vol) = characteristic_length_and_volume(&p);
+            if l.is_finite() && vol > 0.0 {
                 dt = dt.min(l * self.dt_factor[e]);
             }
         }

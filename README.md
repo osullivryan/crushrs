@@ -15,7 +15,8 @@ head-on crash takes about 0.2 s.
 ```bash
 cargo run --release -- crash 30 30 --gif crash.gif          # Silverado vs Neon head-on
 cargo run --release -- tbone 30 0 -1.2 --vtk out/tbone      # Silverado into the Neon's side
-cargo run --release -- barrier neon                         # NCAP barrier test vs NHTSA targets
+cargo run --release -- barrier neon                         # NCAP barrier test vs NHTSA KW400 targets
+cargo run --release -- barrier neon-pulse --pulse data/nhtsa/v02320tsv.078   # vs the measured NCAP pulse
 cargo run --release -- run examples/crash_impact.toml       # any TOML setup (writes out/crash.*.parquet)
 ```
 
@@ -33,8 +34,11 @@ Neon        +18.81 m/s  +42.1 mph   1093 mm   (+17.69 m/s)
   exact rank-12 hourglass stabilisation that is zero on any uniform strain or
   rigid rotation (`element.rs`). Inverted elements are eroded.
 - **Materials** (`material.rs`): honeycomb (rate form, no eigen-solve — the
-  SIMD kernel model); isotropic crushable foam and J2 metal plasticity
-  (finite-strain Hencky, reference models, scalar kernel); linear elastic.
+  SIMD kernel model) with bilinear or tabulated yield-vs-compaction
+  (`curve = [[c, σ], ...]`, up to 8 knots, plus `densification = [c_lock,
+  k_lock]` lock-up); only compression compacts. Isotropic crushable foam and
+  J2 metal plasticity (finite-strain Hencky, reference models, scalar
+  kernel); linear elastic.
 - **Contact:** node-to-face penalty on quad face sets, two-way pairs.
 - **Explicit integration:** central difference, per-element stability
   limit `f(ν)·L/c_d` re-evaluated as elements crush; f32 lane kernel
@@ -54,6 +58,27 @@ Neon        +18.81 m/s  +42.1 mph   1093 mm   (+17.69 m/s)
 
 Side impacts use `Vehicle::side_profile()` (the block turned 90° with a side
 crush curve from FMVSS 214 barrier-test coefficients).
+
+### Calibrating to a measured pulse
+
+`barrier <vehicle> --pulse <nhtsa tsv> [--calibrate N]` compares the
+simulated rear-seat accelerometer with a measured NHTSA channel (CFC 60
+both, velocity and crush by integration) and, with `--calibrate`, fits the
+vehicle to it: a 7-knot force–crush table for the crush zone (+ lock-up),
+crush-zone and body moduli, by pattern search on a velocity-history
+objective (~15 barrier runs per round). `neon-pulse` is the 1996 Neon fitted
+to NHTSA test 2320 (`data/nhtsa/`): a 1.5 m crush zone of 0.1 m elements and
+190 kg ahead of an elastic body, so the plastic wave reaches the cabin fast
+enough. Measured vs simulated: Δv 17.65 vs 17.4–17.6 m/s, peak −35 vs −33 g,
+max crush 736 vs 800 mm at 78 vs 84 ms, restitution 0.17 vs 0.10–0.13
+(rebound scatters ±0.3 m/s run to run: the lock-up front is chaotic).
+
+![Neon pulse](docs/neon_pulse.png)
+
+What a homogenised block cannot do: the real car decelerates the cabin
+within 3 ms through stiff rails while the engine mass is still free; the
+block needs ~10 ms for its plastic wave. And it stores less recoverable
+elastic energy than a real body, so restitution is low by ~0.05.
 
 ## Inputs and outputs
 
@@ -77,6 +102,9 @@ crush curve from FMVSS 214 barrier-test coefficients).
     re-expressed locally afterwards.
   - `out/run.parts.parquet` — per-part mass-weighted mean displacement,
     velocity, acceleration (net force / mass) and kinetic energy.
+
+  `--pulse` runs also write `<base>.pulse.parquet` (measured vs simulated
+  acceleration, velocity, crush on one time grid).
 
   Accelerometers work like LS-DYNA's `*ELEMENT_SEATBELT_ACCELEROMETER`: a
   frame is three nodes (origin, +x node, node in the x–y plane) re-evaluated

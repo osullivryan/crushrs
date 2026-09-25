@@ -169,14 +169,19 @@ impl HexGeometry {
 /// Current characteristic length V / A_max of a hexahedron (LS-DYNA
 /// convention), from its 8 current node positions; +∞ if inverted.
 pub fn characteristic_length(p: &[Vector3<f64>; 8]) -> f64 {
+    characteristic_length_and_volume(p).0
+}
+
+/// Characteristic length and current volume of a hexahedron.
+pub fn characteristic_length_and_volume(p: &[Vector3<f64>; 8]) -> (f64, f64) {
     const TETS: [[usize; 4]; 6] = [[0, 1, 2, 6], [0, 2, 3, 6], [0, 3, 7, 6], [0, 7, 4, 6], [0, 4, 5, 6], [0, 5, 1, 6]];
     const FACES: [[usize; 4]; 6] = [[0, 1, 2, 3], [4, 5, 6, 7], [0, 1, 5, 4], [1, 2, 6, 5], [2, 3, 7, 6], [3, 0, 4, 7]];
     let vol: f64 = TETS.iter().map(|t| (p[t[1]] - p[t[0]]).cross(&(p[t[2]] - p[t[0]])).dot(&(p[t[3]] - p[t[0]])) / 6.0).sum();
     let a_max = FACES.iter().map(|q| 0.5 * (p[q[2]] - p[q[0]]).cross(&(p[q[3]] - p[q[1]])).norm()).fold(0.0_f64, f64::max);
     if vol <= 0.0 || a_max <= 0.0 {
-        f64::INFINITY
+        (f64::INFINITY, vol)
     } else {
-        vol / a_max
+        (vol / a_max, vol)
     }
 }
 

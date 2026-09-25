@@ -14,6 +14,7 @@ pub mod material;
 pub mod mesh;
 pub mod model;
 pub mod output;
+pub mod signal;
 pub mod solver;
 pub mod vehicle;
 

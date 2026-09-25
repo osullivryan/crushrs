@@ -168,7 +168,7 @@ impl Model {
     pub fn add_accelerometer_at(&mut self, name: &str, part: &str, at: [f64; 3]) -> &mut Self {
         let p = self.mesh.part_index(part).unwrap_or_else(|| panic!("no part '{}'", part));
         let rec = self.mesh.nearest_node(at, Some(p));
-        let radius = 1.75 * self.mesh.min_edge_length();
+        let radius = 1.75 * self.mesh.min_edge_at(rec);
         // x axis: neighbour towards +X; if there is none, take the one
         // towards -X and make it the origin so local x still points +X.
         let (mut origin, mut x_axis) = (rec, rec);

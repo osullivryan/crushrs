@@ -208,10 +208,22 @@ pub fn run(model: &Model) -> Results {
     let mut contacts: Vec<ContactRuntime> = model.contacts.iter().map(|c| ContactRuntime::new(c, &model.mesh.faces, &model.mesh.nodes)).collect();
     let fixed: Vec<usize> = model.fixed_nodes.iter().flat_map(|n| [3 * n, 3 * n + 1, 3 * n + 2]).collect();
 
-    // Time step.
+    // Time step: element stability, and the penalty springs' own limit
+    // 2·√(m/k) for the lightest contacting node (both scaled by dt_scale).
     let mut u = vec![0.0; n];
+    let contact_dt = model
+        .contacts
+        .iter()
+        .flat_map(|c| c.nodes.iter().map(move |&nd| (nd, c.stiffness)))
+        .filter(|(nd, k)| masses[*nd] > 0.0 && *k > 0.0)
+        .map(|(nd, k)| 2.0 * (masses[nd] / k).sqrt())
+        .fold(f64::INFINITY, f64::min);
     let stable = elements.stable_time_step(&u).unwrap_or_else(|| model.mesh.min_edge_length() / (3.0_f64.sqrt() * elements.material.iter().map(|m| m.dilatational_wave_speed()).fold(0.0, f64::max)));
+    let stable = stable.min(contact_dt);
     let mut dt = s.time_step.unwrap_or(stable * s.dt_scale);
+    if contact_dt < stable * 1.0001 {
+        debug!("time step limited by contact penalty stiffness: {:.3e} s", contact_dt);
+    }
     let adaptive = s.time_step.is_none() && s.adaptive_check_steps > 0;
     debug!("stable dt {:.3e} s, using {:.3e} s (adaptive: {}, simd: {}, threads: {})", stable, dt, adaptive, elements.uses_simd(), threads);
     if elements.uses_simd() {
@@ -270,7 +282,7 @@ pub fn run(model: &Model) -> Results {
     while t < s.end_time {
         if adaptive && step % s.adaptive_check_steps == 0 {
             if let Some(dt_stable) = elements.stable_time_step(&u) {
-                dt_cfl = s.dt_scale * dt_stable;
+                dt_cfl = s.dt_scale * dt_stable.min(contact_dt);
             }
         }
         dt = dt_cfl.min(s.end_time - t).max(1e-15);

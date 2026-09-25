@@ -11,7 +11,7 @@
 //! The scalar f64 path in `kernel.rs` is the reference; `tests` check the
 //! two agree on the same element.
 
-use crate::material::{HoneycombParams, RateFoamState};
+use crate::material::{HoneycombParams, RateFoamState, MAX_KNOTS};
 use nalgebra::Matrix3;
 
 /// Elements per block (AVX2: 8 × f32 = 256 bit).
@@ -81,10 +81,10 @@ fn select(m: [bool; L], a: V, b: V) -> V {
     r
 }
 #[inline(always)]
-fn abs(a: V) -> V {
+fn max(a: V, b: V) -> V {
     let mut r = ZERO;
     for l in 0..L {
-        r[l] = a[l].abs();
+        r[l] = a[l].max(b[l]);
     }
     r
 }
@@ -191,6 +191,10 @@ pub struct Block {
     pub youngs: V,
     pub yield0: V,
     pub hard: V,
+    /// Yield curve knots: compaction, stress, slope (unused knots at +inf).
+    pub knot_c: [V; MAX_KNOTS],
+    pub knot_s: [V; MAX_KNOTS],
+    pub knot_h: [V; MAX_KNOTS],
     // material state
     pub f_prev_inv: M3,
     pub rotation: M3,
@@ -212,6 +216,9 @@ impl Block {
             youngs: splat(1.0),
             yield0: splat(1.0),
             hard: ZERO,
+            knot_c: [splat(f32::INFINITY); MAX_KNOTS],
+            knot_s: [ZERO; MAX_KNOTS],
+            knot_h: [ZERO; MAX_KNOTS],
             f_prev_inv: identity(),
             rotation: identity(),
             stress: [ZERO; 6],
@@ -253,6 +260,11 @@ impl Block {
         self.youngs[l] = prm.youngs_modulus as f32;
         self.yield0[l] = prm.yield_stress as f32;
         self.hard[l] = prm.hardening as f32;
+        for i in 0..MAX_KNOTS {
+            self.knot_c[i][l] = prm.knots[i][0] as f32;
+            self.knot_s[i][l] = prm.knots[i][1] as f32;
+            self.knot_h[i][l] = prm.knots[i][2] as f32;
+        }
         for i in 0..3 {
             for j in 0..3 {
                 self.f_prev_inv[3 * i + j][l] = state.f_prev_inv[(i, j)] as f32;
@@ -356,15 +368,31 @@ fn block_forces_impl(b: &mut Block, u: &[f64], positions: &[[f64; 3]], out: &mut
     s[3] = fma(e, de[1], s[3]);
     s[4] = fma(e, de[5], s[4]);
     s[5] = fma(e, de[2], s[5]);
+    // Yield stress and slope at the current compaction from the knot table
+    // (branch-free segment scan; unused knots sit at +inf).
+    let mut kc = b.knot_c[0];
+    let mut ks = b.knot_s[0];
+    let mut kh = b.knot_h[0];
+    for i in 1..MAX_KNOTS {
+        let mut m = [false; L];
+        for l in 0..L {
+            m[l] = b.compaction[l] >= b.knot_c[i][l];
+        }
+        kc = select(m, b.knot_c[i], kc);
+        ks = select(m, b.knot_s[i], ks);
+        kh = select(m, b.knot_h[i], kh);
+    }
+    let hard = kh;
+    let sigma_yc = fma(hard, sub(b.compaction, kc), ks);
     // Caps with implicit hardening: 3 fixed passes of the active-set solve.
-    let sigma_yc = fma(b.hard, b.compaction, b.yield0);
     let mut dc = ZERO;
     for _ in 0..3 {
-        let sigma_y = fma(b.hard, dc, sigma_yc);
+        let sigma_y = fma(hard, dc, sigma_yc);
         let mut sum = ZERO;
         let mut n_active = ZERO;
         for k in 0..3 {
-            let a = abs(s[k]);
+            // Only compression compacts (tension is just capped below).
+            let a = scale(s[k], -1.0);
             let mut over = [false; L];
             for l in 0..L {
                 over[l] = a[l] > sigma_y[l];
@@ -372,7 +400,7 @@ fn block_forces_impl(b: &mut Block, u: &[f64], positions: &[[f64; 3]], out: &mut
             sum = add(sum, select(over, sub(a, sigma_yc), ZERO));
             n_active = add(n_active, select(over, splat(1.0), ZERO));
         }
-        let den = fma(n_active, b.hard, e);
+        let den = fma(n_active, hard, e);
         let dc_new = div(sum, den);
         let mut any = [false; L];
         for l in 0..L {
@@ -380,7 +408,7 @@ fn block_forces_impl(b: &mut Block, u: &[f64], positions: &[[f64; 3]], out: &mut
         }
         dc = select(any, dc_new, ZERO);
     }
-    let sigma_y = fma(b.hard, dc, sigma_yc);
+    let sigma_y = max(fma(hard, dc, sigma_yc), ZERO);
     let neg_sigma_y = scale(sigma_y, -1.0);
     for k in 0..3 {
         s[k] = clamp(s[k], neg_sigma_y, sigma_y);
@@ -575,8 +603,7 @@ mod tests {
 
     /// A crushing element stepped 200 times: the lane kernel must track the
     /// scalar f64 reference to single precision (stress, compaction, forces).
-    #[test]
-    fn lane_kernel_matches_scalar_reference() {
+    fn check_lane_vs_scalar(prm: &HoneycombParams) {
         let cube: Vec<[f64; 3]> = crate::element::XI.iter().map(|s| [0.15 * (s[0] + 1.0), 0.15 * (s[1] + 1.0), 0.15 * (s[2] + 1.0)]).collect();
         let mut grad = [0.0; 24];
         for i in 0..8 {
@@ -586,10 +613,9 @@ mod tests {
         }
         let gamma = nalgebra::SMatrix::<f64, 8, 4>::zeros();
         let h = nalgebra::SMatrix::<f64, 12, 12>::zeros();
-        let prm = HoneycombParams { youngs_modulus: 125.8e6, yield_stress: 1234.0, hardening: 800339.0 };
         let conn: [usize; 8] = std::array::from_fn(|i| i);
         let mut block = Block::empty();
-        block.set_lane(0, conn, &grad, 0.027, &gamma, &h, &prm, &RateFoamState::default(), false);
+        block.set_lane(0, conn, &grad, 0.027, &gamma, &h, prm, &RateFoamState::default(), false);
         let mut state = RateFoamState::default();
         let mut out = [[0.0f32; 24]; L];
         for step in 1..=200 {
@@ -609,11 +635,11 @@ mod tests {
                     }
                 }
             }
-            let (tau, ns) = honeycomb_rate_update(&prm, &f, &state);
+            let (tau, ns) = honeycomb_rate_update(prm, &f, &state);
             state = ns;
             let m = tau * f.try_inverse().unwrap().transpose() * 0.027;
             let lane = block.lane_state(0);
-            let floor = 1e-6 * prm.youngs_modulus + 2e-3 * (prm.yield_stress + prm.hardening * state.compaction);
+            let floor = 1e-6 * prm.youngs_modulus + 2e-3 * prm.yield_at(state.compaction).0;
             assert!((lane.compaction - state.compaction).abs() < 1e-3 * state.compaction.max(1e-6) + 1e-6, "step {}: compaction {} vs {}", step, lane.compaction, state.compaction);
             for k in 0..6 {
                 assert!((lane.stress[k] - state.stress[k]).abs() < floor, "step {} stress[{}]: {} vs {}", step, k, lane.stress[k], state.stress[k]);
@@ -626,5 +652,25 @@ mod tests {
             }
         }
         assert!(state.compaction > 0.3);
+    }
+
+    #[test]
+    fn lane_kernel_matches_scalar_reference() {
+        check_lane_vs_scalar(&HoneycombParams::new(125.8e6, 1234.0, 800339.0));
+    }
+
+    #[test]
+    fn lane_kernel_matches_scalar_with_tabulated_curve() {
+        // Plateau, dip, steep rise, then flat: exercises every knot branch.
+        let m = crate::material::Material::honeycomb_curve(23.1e6, 100.0, vec![[0.0, 7000.0], [0.05, 10000.0], [0.15, 6000.0], [0.3, 30000.0], [0.45, 30000.0]], Some([1.0, 2.0e6]));
+        let prm = HoneycombParams::from_material(&m);
+        let close = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).abs() < 1e-9 * b.0.abs().max(1.0) && (a.1 - b.1).abs() < 1e-9 * b.1.abs().max(1.0);
+        assert!(close(prm.yield_at(0.0), (7000.0, 60000.0)));
+        assert!(close(prm.yield_at(0.1), (8000.0, -40000.0)));
+        assert!(close(prm.yield_at(0.6), (30000.0, 0.0)));
+        assert!(close(prm.yield_at(1.5), (30000.0 + 1.0e6, 2.0e6)));
+        assert!(close(m.plasticity.as_ref().unwrap().yield_at(1.5), prm.yield_at(1.5)));
+        assert!(close(m.plasticity.as_ref().unwrap().yield_at(0.1), prm.yield_at(0.1)));
+        check_lane_vs_scalar(&prm);
     }
 }

@@ -213,7 +213,11 @@ impl Config {
             if model.mesh.part_index(&m.part).is_none() {
                 return Err(format!("material for unknown part '{}'", m.part));
             }
-            model.set_material(&m.part, m.material);
+            let mut material = m.material.clone();
+            if let Some(p) = material.plasticity.as_mut() {
+                p.normalise().map_err(|e| format!("material for part '{}': {}", m.part, e))?;
+            }
+            model.set_material(&m.part, material);
         }
         for iv in &self.initial_velocity {
             if model.mesh.nodes_of(&iv.set).is_none() {

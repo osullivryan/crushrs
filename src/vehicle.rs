@@ -95,6 +95,22 @@ pub struct Vehicle {
     pub side_curve: Option<CrushCurve>,
     /// Modulus of the side profile (Pa); `None` = `modulus`.
     pub side_modulus: Option<f64>,
+    /// Tabulated frontal force–crush curve `[[crush m, force N], ...]`
+    /// (from a measured pulse, see [`calibrate_pulse`]). When set it
+    /// replaces `curve` for the crush material.
+    pub force_table: Option<Vec<[f64; 2]>>,
+    /// Element length along the crush direction inside the crush zone
+    /// (`None` = the block element size). Only used when the crush zone is
+    /// shorter than the vehicle.
+    pub crush_element_size: Option<f64>,
+    /// Compaction at each `force_table` knot (from [`calibrate_pulse`]);
+    /// `None` = uniform crush of the crush zone, `c = −ln(1 − x/L_c)`.
+    pub compaction_map: Option<Vec<f64>>,
+    /// Mass of the crush-zone material (kg); the rest of the vehicle mass
+    /// sits in the body block. `None` = uniform density. A light crush
+    /// zone carries the plastic wave faster (√(H/ρ)), like real rails
+    /// ahead of the engine and cabin mass.
+    pub crush_zone_mass: Option<f64>,
 }
 
 impl Vehicle {
@@ -127,7 +143,7 @@ impl Vehicle {
             modulus,
             body_modulus: modulus,
             side_curve: None,
-            side_modulus: None,
+            side_modulus: None, force_table: None, crush_element_size: None, compaction_map: None, crush_zone_mass: None,
         }
     }
 
@@ -153,7 +169,7 @@ impl Vehicle {
             modulus: self.side_modulus.unwrap_or(self.modulus),
             body_modulus: self.side_modulus.unwrap_or(self.modulus),
             side_curve: None,
-            side_modulus: None,
+            side_modulus: None, force_table: None, crush_element_size: None, compaction_map: None, crush_zone_mass: None,
         }
     }
 
@@ -161,18 +177,75 @@ impl Vehicle {
         self.size[1] * self.size[2]
     }
 
+    /// Whether the crush zone is shorter than the block (two-part vehicle).
+    pub fn has_crush_zone(&self) -> bool {
+        self.crush_zone_length < self.size[0] - 1e-9
+    }
+
+    /// Part name of the crush zone when [`has_crush_zone`](Self::has_crush_zone).
+    pub fn crush_part_name(&self) -> String {
+        format!("{}_crush", self.name)
+    }
+
+    /// Stiffness scale for contact penalties (N/m).
+    pub fn contact_stiffness_reference(&self) -> f64 {
+        match &self.force_table {
+            Some(t) => {
+                let last = t.last().unwrap();
+                (last[1] / last[0].max(1e-3)).max(self.curve.stiffness)
+            }
+            None => self.curve.stiffness,
+        }
+    }
+
     pub fn density(&self) -> f64 {
         self.mass / (self.size[0] * self.size[1] * self.size[2])
+    }
+
+    /// Density of the crush-zone material.
+    pub fn crush_density(&self) -> f64 {
+        match self.crush_zone_mass {
+            Some(m) if self.has_crush_zone() => m / (self.crush_zone_length * self.frontal_area()),
+            _ => self.density(),
+        }
+    }
+
+    /// Density of the body block behind the crush zone.
+    pub fn body_density(&self) -> f64 {
+        match self.crush_zone_mass {
+            Some(m) if self.has_crush_zone() => (self.mass - m) / ((self.size[0] - self.crush_zone_length) * self.frontal_area()),
+            _ => self.density(),
+        }
     }
 
     /// Crush-zone material: honeycomb (rate form) with `σ_y = F_y/A`, `H = k·L_c/A`.
     pub fn crush_material(&self) -> Material {
         let a = self.frontal_area();
-        Material::honeycomb(self.modulus, self.density(), self.curve.yield_force / a, self.curve.stiffness * self.crush_zone_length / a)
+        match &self.force_table {
+            Some(table) => {
+                let curve = match &self.compaction_map {
+                    Some(cm) if cm.len() == table.len() => table.iter().zip(cm).map(|([_, f], c)| [*c, f / a]).collect(),
+                    _ => Self::yield_curve(table, self.crush_zone_length, a),
+                };
+                Material::honeycomb_curve(self.modulus, self.crush_density(), curve, Some([Self::LOCK_COMPACTION, Self::LOCK_SLOPE_FACTOR * self.modulus]))
+            }
+            None => Material::honeycomb(self.modulus, self.crush_density(), self.curve.yield_force / a, self.curve.stiffness * self.crush_zone_length / a),
+        }
+    }
+
+    /// Compaction at which a tabulated crush material locks up (≈ 75 %
+    /// crushed); beyond it the yield stress rises with `LOCK_SLOPE_FACTOR·E`.
+    pub const LOCK_COMPACTION: f64 = 1.4;
+    pub const LOCK_SLOPE_FACTOR: f64 = 0.3;
+
+    /// Force–crush table → yield stress vs compaction, assuming the crush
+    /// zone (length `l`) compacts uniformly: `c = −ln(1 − x/l)`, `σ = F/A`.
+    pub fn yield_curve(table: &[[f64; 2]], l: f64, area: f64) -> Vec<[f64; 2]> {
+        table.iter().map(|[x, f]| [-(1.0 - (x / l).min(0.95)).ln(), f / area]).collect()
     }
 
     pub fn body_material(&self) -> Material {
-        Material::elastic(self.body_modulus, 0.3, self.density())
+        Material::elastic(self.body_modulus, 0.3, self.body_density())
     }
 
     /// Expected dynamic crush and peak force in a rigid-barrier test at `speed`.
@@ -192,6 +265,26 @@ impl Vehicle {
     }
 
     /// 2007 Chevrolet Silverado 1500 crew cab: NCAP test weight 2622 kg,
+    /// 1996 Dodge Neon fitted to the left-rear-seat X pulse of NHTSA test
+    /// 2320 (NCAP, 56.5 km/h rigid barrier, 1354 kg; curve 78, CFC 60) with
+    /// [`calibrate_pulse`]: a 1.5 m crush zone of 0.1 m elements and 190 kg
+    /// ahead of an elastic body. Simulated vs measured: delta-v 17.64 vs
+    /// 17.65 m/s at 150 ms, peak −32.9 vs −35.2 g, max crush 800 vs 736 mm
+    /// at 83 vs 78 ms, restitution 0.13 vs 0.17, CFC 60 RMS error 6.2 g.
+    /// `crushrs barrier neon-pulse --pulse data/nhtsa/v02320tsv.078`.
+    pub fn dodge_neon_1996_pulse() -> Self {
+        let mut v = Vehicle::dodge_neon_1996_tuned();
+        v.crush_zone_length = 1.5;
+        v.crush_element_size = Some(0.1);
+        v.crush_zone_mass = Some(190.0);
+        v.modulus = 4e6;
+        v.body_modulus = 2.7e8;
+        let knots = [0.0, 0.1165, 0.2330, 0.3496, 0.4661, 0.5826, 0.6991];
+        let force_kn = [13.0, 135.0, 135.0, 146.0, 361.0, 364.0, 364.0];
+        v.force_table = Some(knots.iter().zip(force_kn).map(|(x, f)| [*x, f * 1e3]).collect());
+        v
+    }
+
     /// KW400 = 2550 N/mm (NHTSA DOT HS 811 293), pickup-class CRASH3 A/B.
     pub fn chevrolet_silverado_2007() -> Self {
         Vehicle::from_ncap("silverado", 2622.0, [5.85, 2.03, 1.87], 5.85, 2.550e6, crash3_ratio(86.36, 11.72), 0.12, 35.0 * 0.44704)
@@ -250,7 +343,33 @@ pub fn add_vehicle(mesh: &mut Mesh, v: &Vehicle, front_x: f64, y_center: f64, z_
         Heading::MinusX => (front_x, BlockFace::XMin),
     };
     let front = format!("{}_front", v.name);
-    mesh.add_hex_block(&v.name, [x0, y_center - v.size[1] / 2.0, z_bottom], v.size, element_size, &[(face, &front)])
+    let origin = [x0, y_center - v.size[1] / 2.0, z_bottom];
+    if !v.has_crush_zone() {
+        return mesh.add_hex_block(&v.name, origin, v.size, element_size, &[(face, &front)]);
+    }
+    // Body block (part `<name>`) and crush-zone block (part `<name>_crush`)
+    // with matching y/z grids, merged at their shared face.
+    let l_c = v.crush_zone_length;
+    let l_b = v.size[0] - l_c;
+    let ny = (v.size[1] / element_size).round().max(1.0) as usize;
+    let nz = (v.size[2] / element_size).round().max(1.0) as usize;
+    let nxb = (l_b / element_size).round().max(1.0) as usize;
+    let nxc = (l_c / v.crush_element_size.unwrap_or(element_size)).round().max(1.0) as usize;
+    let (body_x0, crush_x0) = match heading {
+        Heading::PlusX => (x0, x0 + l_b),
+        Heading::MinusX => (x0 + l_c, x0),
+    };
+    let part = mesh.add_hex_block_n(&v.name, [body_x0, origin[1], origin[2]], [l_b, v.size[1], v.size[2]], [nxb, ny, nz], &[]);
+    let crush_name = v.crush_part_name();
+    mesh.add_hex_block_n(&crush_name, [crush_x0, origin[1], origin[2]], [l_c, v.size[1], v.size[2]], [nxc, ny, nz], &[(face, &front)]);
+    mesh.merge_coincident_nodes(1e-6 * element_size);
+    // Node set `<name>` spans both parts (initial velocity, delta-v).
+    let mut all = mesh.node_sets[&v.name].clone();
+    all.extend(mesh.node_sets[&crush_name].iter().copied());
+    all.sort_unstable();
+    all.dedup();
+    mesh.node_sets.insert(v.name.clone(), all);
+    part
 }
 
 /// Assign the vehicle's crush material and initial velocity in the model.
@@ -258,7 +377,12 @@ pub fn add_vehicle(mesh: &mut Mesh, v: &Vehicle, front_x: f64, y_center: f64, z_
 /// (then the rear elements get the elastic body material — only meaningful
 /// with separate parts, so here the whole part gets the crush material).
 pub fn assign_vehicle(model: &mut Model, v: &Vehicle, heading: Heading, speed: f64) {
-    model.set_material(&v.name, v.crush_material());
+    if v.has_crush_zone() && model.mesh.part_index(&v.crush_part_name()).is_some() {
+        model.set_material(&v.name, v.body_material());
+        model.set_material(&v.crush_part_name(), v.crush_material());
+    } else {
+        model.set_material(&v.name, v.crush_material());
+    }
     let vx = match heading {
         Heading::PlusX => speed,
         Heading::MinusX => -speed,
@@ -290,9 +414,9 @@ pub fn add_vehicle_accelerometer(model: &mut Model, part: &str, front_face: &str
     let mut at = [0.5 * (lo[0] + hi[0]), 0.5 * (lo[1] + hi[1]), lo[2] + 0.35 * (hi[2] - lo[2])];
     for d in 0..2 {
         let len = hi[d] - lo[d];
-        if (c[d] - lo[d]).abs() < 1e-6 * len {
+        if c[d] <= lo[d] + 1e-6 * len {
             at[d] = hi[d] - 0.25 * len;
-        } else if (c[d] - hi[d]).abs() < 1e-6 * len {
+        } else if c[d] >= hi[d] - 1e-6 * len {
             at[d] = lo[d] + 0.25 * len;
         }
     }
@@ -341,12 +465,20 @@ pub fn barrier_metrics(model: &Model, results: &Results, part: &str, axis: usize
 /// NCAP's 25–400 mm (e.g. for side profiles that crush less).
 pub fn barrier_metrics_window(model: &Model, results: &Results, part: &str, axis: usize, window: (f64, f64)) -> BarrierMetrics {
     let p = model.mesh.part_index(part).unwrap_or_else(|| panic!("no part '{}'", part));
+    // A vehicle built with a crush zone is two parts: combine them.
+    let parts: Vec<usize> = [Some(p), model.mesh.part_index(&format!("{}_crush", part))].into_iter().flatten().collect();
     let series: Vec<(f64, f64, f64, f64)> = results
         .history
         .iter()
         .map(|(t, states)| {
-            let s = &states[p];
-            (*t, s.mass, s.velocity[axis], s.displacement[axis])
+            let (mut m, mut mv, mut mu) = (0.0, 0.0, 0.0);
+            for &q in &parts {
+                let s = &states[q];
+                m += s.mass;
+                mv += s.mass * s.velocity[axis];
+                mu += s.mass * s.displacement[axis];
+            }
+            (*t, m, mv / m, mu / m)
         })
         .collect();
     assert!(series.len() > 3, "no history for '{}' (set history_steps)", part);
@@ -409,7 +541,7 @@ pub fn barrier_model(v: &Vehicle, element_size: f64, speed: f64, end_time: f64, 
     // energy (otherwise they return it as spurious restitution).
     let n_face = model.mesh.face_set_nodes(&format!("{}_front", v.name)).unwrap().len() as f64;
     let front = format!("{}_front", v.name);
-    model.add_contact_pair(&front, "wall_face", 400.0 * v.curve.stiffness / n_face, 0.3);
+    model.add_contact_pair(&front, "wall_face", 400.0 * v.contact_stiffness_reference() / n_face, 0.3);
     model.settings.end_time = end_time;
     model.settings.history_steps = 2;
     model.settings.frame_steps = frame_steps;
@@ -483,4 +615,201 @@ pub fn calibrate(v: &Vehicle, targets: &BarrierTargets, element_size: f64, itera
         }
     }
     (tuned, last.unwrap())
+}
+
+/// Measured-vs-simulated rigid-barrier pulse on a common time grid
+/// (CFC 60, m/s², m/s, m).
+#[derive(Debug, Clone)]
+pub struct PulseComparison {
+    pub time: Vec<f64>,
+    pub a_meas: Vec<f64>,
+    pub a_sim: Vec<f64>,
+    pub v_meas: Vec<f64>,
+    pub v_sim: Vec<f64>,
+    pub x_meas: Vec<f64>,
+    pub x_sim: Vec<f64>,
+    pub meas: crate::signal::PulseMetrics,
+    pub sim: crate::signal::PulseMetrics,
+}
+
+impl PulseComparison {
+    /// Both pulses are put on the measured pulse's time grid.
+    pub fn new(meas: &crate::signal::Pulse, sim: &crate::signal::Pulse, mass: f64, speed: f64) -> Self {
+        let t_end = meas.time.last().unwrap().min(*sim.time.last().unwrap());
+        let m = meas.truncated(t_end);
+        let s = if (sim.dt() - m.dt()).abs() > 1e-9 * m.dt() { sim.resampled(m.dt()).truncated(t_end) } else { sim.truncated(t_end) };
+        let n = m.time.len().min(s.time.len());
+        PulseComparison {
+            time: m.time[..n].to_vec(),
+            a_meas: m.accel[..n].to_vec(),
+            a_sim: s.accel[..n].to_vec(),
+            v_meas: m.velocity(speed)[..n].to_vec(),
+            v_sim: s.velocity(speed)[..n].to_vec(),
+            x_meas: m.displacement(speed)[..n].to_vec(),
+            x_sim: s.displacement(speed)[..n].to_vec(),
+            meas: crate::signal::PulseMetrics::new(&m, mass, speed),
+            sim: crate::signal::PulseMetrics::new(&s, mass, speed),
+        }
+    }
+
+    /// RMS difference of the filtered accelerations over the record (m/s²).
+    pub fn rms_accel_error(&self) -> f64 {
+        (self.a_meas.iter().zip(&self.a_sim).map(|(a, b)| (a - b).powi(2)).sum::<f64>() / self.a_meas.len() as f64).sqrt()
+    }
+
+    /// Velocity error at a time (m/s).
+    pub fn velocity_error_at(&self, t: f64) -> f64 {
+        let i = ((t / (self.time[1] - self.time[0])).round() as usize).min(self.time.len() - 1);
+        self.v_sim[i] - self.v_meas[i]
+    }
+
+    pub fn write_parquet(&self, path: &std::path::Path) -> Result<(), String> {
+        use crate::output::parquet::{write_table, Column};
+        let f = |v: &Vec<f64>| Column::F64(v.clone());
+        write_table(
+            path,
+            "pulse",
+            &[("time", f(&self.time)), ("a_meas", f(&self.a_meas)), ("a_sim", f(&self.a_sim)), ("v_meas", f(&self.v_meas)), ("v_sim", f(&self.v_sim)), ("x_meas", f(&self.x_meas)), ("x_sim", f(&self.x_sim))],
+        )
+    }
+}
+
+/// Sampling interval of the simulated pulse used for comparisons (s).
+pub const PULSE_DT: f64 = 1e-4;
+/// Record length compared (s).
+pub const PULSE_END: f64 = 0.15;
+
+/// Rigid-barrier run of `v` with a rear-seat accelerometer, returning the
+/// model, results and the simulated pulse (CFC 60).
+pub fn run_barrier_pulse(v: &Vehicle, element_size: f64, speed: f64, frame_steps: usize) -> (Model, Results, crate::signal::Pulse) {
+    let mut model = barrier_model(v, element_size, speed, PULSE_END, frame_steps);
+    let acc = add_vehicle_accelerometer(&mut model, &v.name, &format!("{}_front", v.name));
+    model.settings.history_steps = 1;
+    let results = crate::solver::run(&model);
+    let pulse = crate::signal::Pulse::from_history(&model, &results, &acc, PULSE_DT).expect("pulse").filtered(60.0);
+    (model, results, pulse)
+}
+
+/// Pulse-matching objective: velocity-history RMS error (m/s) over the
+/// record, plus the end-velocity error (restitution / delta-v) and a small
+/// weight on the CFC 60 acceleration RMS error (in g).
+pub fn pulse_objective(cmp: &PulseComparison) -> f64 {
+    let n = cmp.time.len() as f64;
+    let v_rms = (cmp.v_meas.iter().zip(&cmp.v_sim).map(|(a, b)| (a - b).powi(2)).sum::<f64>() / n).sqrt();
+    let v_end = (cmp.v_sim.last().unwrap() - cmp.v_meas.last().unwrap()).abs();
+    v_rms + 0.5 * v_end + 0.1 * cmp.rms_accel_error() / 9.81
+}
+
+/// Fit the vehicle's tabulated force–crush curve (and crush-zone modulus)
+/// so the simulated rear-seat pulse in a rigid-barrier test reproduces a
+/// measured one (e.g. an NHTSA NCAP rear-seat X accelerometer; it is
+/// CFC 60 filtered here).
+///
+/// The curve has 7 knots spread over the measured dynamic crush (the 8th
+/// is densification), initialised from the smoothed measured force–crush
+/// curve and mapped onto compaction as if the crush zone compacts
+/// uniformly (`c = −ln(1 − x/L_c)`, which is what the block does until
+/// the curve flattens; a flat plateau then localises into a lock-up front
+/// that works through the zone element by element at the plateau force).
+/// Then `rounds` of a pattern search on the log of each knot force, of
+/// the crush-zone modulus and of the body modulus minimise [`pulse_objective`], keeping the table
+/// non-decreasing from the second knot on (a softening segment would
+/// localise into a shock). About 16 barrier runs per round.
+pub fn calibrate_pulse(v: &Vehicle, measured: &crate::signal::Pulse, speed: f64, element_size: f64, rounds: usize, verbose: bool) -> (Vehicle, PulseComparison) {
+    use crate::signal::PulseMetrics;
+    let meas = measured.filtered(60.0).resampled(PULSE_DT).truncated(PULSE_END);
+    let mm = PulseMetrics::new(&meas, v.mass, speed);
+    let n_knots = crate::material::MAX_KNOTS - 1; // one knot is the densification
+    let x_max = mm.max_crush;
+    let spacing = x_max * 0.95 / (n_knots - 1) as f64;
+    let knots: Vec<f64> = (0..n_knots).map(|i| i as f64 * spacing).collect();
+    let w = 0.5 * spacing;
+    let mut tuned = v.clone();
+    if tuned.force_table.as_ref().map_or(true, |t| t.len() != n_knots) {
+        let mut targets: Vec<f64> = knots.iter().map(|&x| mm.mean_force((x - w).max(0.0), (x + w).min(x_max)).unwrap_or(0.0).max(1e3)).collect();
+        for i in 2..targets.len() {
+            targets[i] = targets[i].max(targets[i - 1]);
+        }
+        tuned.force_table = Some(knots.iter().zip(&targets).map(|(x, f)| [*x, *f]).collect());
+        tuned.compaction_map = None;
+    }
+
+    let evaluate = |cand: &Vehicle| -> PulseComparison {
+        let (_, _, sim) = run_barrier_pulse(cand, element_size, speed, 0);
+        PulseComparison::new(&meas, &sim, v.mass, speed)
+    };
+    let report = |tag: &str, cand: &Vehicle, cmp: &PulseComparison| {
+        let sm = &cmp.sim;
+        log::info!(
+            "pulse calibrate {} {}: J {:.3}, peak {:.1}/{:.1} g, crush {:.0}/{:.0} mm at {:.0}/{:.0} ms, e {:.3}/{:.3}, rms Δa {:.2} g, v(end) err {:+.2} m/s, E {:.1} MPa, E_body {:.0} MPa, table kN {}",
+            cand.name,
+            tag,
+            pulse_objective(cmp),
+            sm.peak_accel / 9.81,
+            mm.peak_accel / 9.81,
+            sm.max_crush * 1e3,
+            mm.max_crush * 1e3,
+            sm.t_max_crush * 1e3,
+            mm.t_max_crush * 1e3,
+            sm.restitution,
+            mm.restitution,
+            cmp.rms_accel_error() / 9.81,
+            cmp.v_sim.last().unwrap() - cmp.v_meas.last().unwrap(),
+            cand.modulus / 1e6,
+            cand.body_modulus / 1e6,
+            cand.force_table.as_ref().unwrap().iter().map(|[_, f]| format!("{:.0}", f / 1e3)).collect::<Vec<_>>().join(" ")
+        );
+    };
+
+    let mut best_cmp = evaluate(&tuned);
+    let mut best_j = pulse_objective(&best_cmp);
+    if verbose {
+        report("start", &tuned, &best_cmp);
+    }
+    let mut step = 0.3_f64; // in ln(force) / ln(E)
+    for round in 0..rounds {
+        let mut improved = false;
+        for param in 0..=n_knots + 1 {
+            for dir in [1.0, -1.0] {
+                let mut cand = tuned.clone();
+                let factor = (dir * step).exp();
+                if param < n_knots {
+                    let t = cand.force_table.as_mut().unwrap();
+                    t[param][1] *= factor;
+                    for i in 2..t.len() {
+                        t[i][1] = t[i][1].max(t[i - 1][1]);
+                    }
+                    if t == tuned.force_table.as_ref().unwrap() {
+                        continue;
+                    }
+                } else if param == n_knots {
+                    cand.modulus = (cand.modulus * factor).clamp(2e6, 500e6);
+                } else {
+                    cand.body_modulus = (cand.body_modulus * factor).clamp(2e7, 5e9);
+                }
+                let cmp = evaluate(&cand);
+                let j = pulse_objective(&cmp);
+                if j < best_j {
+                    best_j = j;
+                    tuned = cand;
+                    best_cmp = cmp;
+                    improved = true;
+                    if verbose {
+                        report(&format!("round {} p{}{}", round, param, if dir > 0.0 { "+" } else { "-" }), &tuned, &best_cmp);
+                    }
+                    break;
+                }
+            }
+        }
+        if !improved {
+            step *= 0.5;
+            if verbose {
+                log::info!("pulse calibrate {}: round {} no improvement, step -> {:.3}", tuned.name, round, step);
+            }
+            if step < 0.04 {
+                break;
+            }
+        }
+    }
+    (tuned, best_cmp)
 }

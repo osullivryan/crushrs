@@ -7,7 +7,7 @@
 
 use clap::{Args, Parser, Subcommand};
 use crushrs::output::gif::{write_gif, GifOptions};
-use crushrs::vehicle::{add_vehicle, add_vehicle_accelerometer, assign_vehicle, barrier_metrics_window, calibrate, barrier_model, BarrierTargets, Heading, Vehicle};
+use crushrs::vehicle::{add_vehicle, add_vehicle_accelerometer, assign_vehicle, barrier_metrics_window, barrier_model, calibrate, calibrate_pulse, BarrierTargets, Heading, PulseComparison, Vehicle, PULSE_DT, PULSE_END};
 use crushrs::{BlockFace, Mesh, Model, Results, MPH};
 use nalgebra::Vector3;
 use std::path::Path;
@@ -36,6 +36,23 @@ enum Cmd {
         /// Calibrate from the starting point for N iterations.
         #[arg(long)]
         calibrate: Option<usize>,
+        /// Measured barrier pulse (NHTSA ASCII signal file, time[s] TAB g):
+        /// compare against it and, with --calibrate, fit the force-crush
+        /// table to it instead of the KW400 targets.
+        #[arg(long)]
+        pulse: Option<String>,
+        /// Override the crush-zone modulus (Pa) before running / calibrating.
+        #[arg(long)]
+        modulus: Option<f64>,
+        /// Override the body modulus (Pa) before running / calibrating.
+        #[arg(long)]
+        body_modulus: Option<f64>,
+        /// Override the crush-zone length (m).
+        #[arg(long)]
+        crush_zone: Option<f64>,
+        /// Override the crush-zone mass (kg).
+        #[arg(long)]
+        crush_mass: Option<f64>,
         #[command(flatten)]
         out: Out,
     },
@@ -154,7 +171,72 @@ fn main() {
             }
             outputs(&model, &results, &out, None);
         }
-        Cmd::Barrier { vehicle, element_size, calibrate: cal, out } => {
+        Cmd::Barrier { vehicle, element_size, calibrate: cal, pulse, modulus, body_modulus, crush_zone, crush_mass, out } => {
+            if let Some(pulse_file) = pulse {
+                let mut v = match vehicle.as_str() {
+                    "silverado" => Vehicle::chevrolet_silverado_2007_tuned(),
+                    "silverado-raw" => Vehicle::chevrolet_silverado_2007(),
+                    "neon-raw" => Vehicle::dodge_neon_1996(),
+                    "neon-pulse" => Vehicle::dodge_neon_1996_pulse(),
+                    _ => Vehicle::dodge_neon_1996_tuned(),
+                };
+                if let Some(e) = modulus {
+                    v.modulus = e;
+                }
+                if let Some(e) = body_modulus {
+                    v.body_modulus = e;
+                }
+                if let Some(l) = crush_zone {
+                    v.crush_zone_length = l;
+                    v.force_table = None;
+                }
+                if let Some(m) = crush_mass {
+                    v.crush_zone_mass = Some(m);
+                }
+                let speed = 35.0 * MPH;
+                let measured = crushrs::signal::Pulse::read_nhtsa_tsv(Path::new(&pulse_file), true).unwrap_or_else(|e| panic!("{}", e));
+                println!("{}: {:.0} kg at {:.1} m/s vs measured pulse {} ({} samples at {:.0} kHz)", v.name, v.mass, speed, pulse_file, measured.time.len(), 1e-3 / measured.dt());
+                let v = match cal {
+                    Some(n) => {
+                        let (tuned, _) = calibrate_pulse(&v, &measured, speed, element_size, n, true);
+                        tuned
+                    }
+                    None => v,
+                };
+                let mut model = barrier_model(&v, element_size, speed, PULSE_END, if out.gif.is_some() || out.vtk.is_some() { 20 } else { 0 });
+                let acc = add_vehicle_accelerometer(&mut model, &v.name, &format!("{}_front", v.name));
+                out.configure(&mut model);
+                model.settings.history_steps = 1;
+                let results = crushrs::run(&model);
+                let sim = crushrs::signal::Pulse::from_history(&model, &results, &acc, PULSE_DT).unwrap().filtered(60.0);
+                let cmp = PulseComparison::new(&measured.filtered(60.0).resampled(PULSE_DT).truncated(PULSE_END), &sim, v.mass, speed);
+                if let Some(t) = &v.force_table {
+                    println!("force-crush table (crush mm, force kN): {}", t.iter().map(|[x, f]| format!("({:.0}, {:.0})", x * 1e3, f / 1e3)).collect::<Vec<_>>().join(" "));
+                    if let Some(cm) = &v.compaction_map {
+                        println!("knot compactions: {}", cm.iter().map(|c| format!("{:.3}", c)).collect::<Vec<_>>().join(" "));
+                    }
+                    println!("modulus {:.1} MPa, body modulus {:.0} MPa, crush zone {:.2} m ({:.0} kg), elements {:.2} m", v.modulus / 1e6, v.body_modulus / 1e6, v.crush_zone_length, v.crush_zone_mass.unwrap_or(v.mass * v.crush_zone_length / v.size[0]), v.crush_element_size.unwrap_or(element_size));
+                }
+                println!("{} elements, {} steps, {:.2?}", model.mesh.hexes.len(), results.steps, results.wall_time);
+                println!("  t[ms]   a_meas   a_sim [g]    v_meas   v_sim [m/s]   x_meas   x_sim [mm]");
+                let step = (0.005 / PULSE_DT).round() as usize;
+                for i in (0..cmp.time.len()).step_by(step) {
+                    println!("  {:5.0}   {:6.1}   {:6.1}       {:6.2}   {:6.2}       {:6.0}   {:6.0}", cmp.time[i] * 1e3, cmp.a_meas[i] / 9.81, cmp.a_sim[i] / 9.81, cmp.v_meas[i], cmp.v_sim[i], cmp.x_meas[i] * 1e3, cmp.x_sim[i] * 1e3);
+                }
+                println!("                    measured   simulated");
+                println!("peak accel (CFC60) {:8.1}    {:8.1} g", cmp.meas.peak_accel / 9.81, cmp.sim.peak_accel / 9.81);
+                println!("max crush          {:8.0}    {:8.0} mm  at {:.0} / {:.0} ms", cmp.meas.max_crush * 1e3, cmp.sim.max_crush * 1e3, cmp.meas.t_max_crush * 1e3, cmp.sim.t_max_crush * 1e3);
+                println!("restitution        {:8.3}    {:8.3}", cmp.meas.restitution, cmp.sim.restitution);
+                println!("v at {:.0} ms       {:8.2}    {:8.2} m/s", cmp.time.last().unwrap() * 1e3, cmp.v_meas.last().unwrap(), cmp.v_sim.last().unwrap());
+                println!("rms accel error    {:8.2} g", cmp.rms_accel_error() / 9.81);
+                if let Some(base) = &out.history {
+                    let path = format!("{}.pulse.parquet", base);
+                    cmp.write_parquet(Path::new(&path)).expect("write pulse");
+                    println!("wrote {}", path);
+                }
+                outputs(&model, &results, &out, None);
+                return;
+            }
             let (v, target) = match vehicle.as_str() {
                 "silverado" => (Vehicle::chevrolet_silverado_2007_tuned(), Vehicle::chevrolet_silverado_2007()),
                 "silverado-raw" => (Vehicle::chevrolet_silverado_2007(), Vehicle::chevrolet_silverado_2007()),
@@ -174,7 +256,7 @@ fn main() {
                     let t = BarrierTargets::from_curve(&target, speed, window, 0.12);
                     let (tuned, _) = calibrate(&v, &t, element_size, n, true);
                     let cm = tuned.crush_material();
-                    println!("calibrated at h = {} m: F_y = {:.2} kN, k = {:.3} MN/m, E = {:.1} MPa  (sigma_y = {:.0} Pa, H = {:.0} Pa)", element_size, tuned.curve.yield_force / 1e3, tuned.curve.stiffness / 1e6, tuned.modulus / 1e6, cm.plasticity.unwrap().yield_stress, cm.plasticity.unwrap().hardening);
+                    println!("calibrated at h = {} m: F_y = {:.2} kN, k = {:.3} MN/m, E = {:.1} MPa  (sigma_y = {:.0} Pa, H = {:.0} Pa)", element_size, tuned.curve.yield_force / 1e3, tuned.curve.stiffness / 1e6, tuned.modulus / 1e6, cm.plasticity.as_ref().unwrap().yield_stress, cm.plasticity.as_ref().unwrap().hardening);
                     tuned
                 }
                 None => v,
