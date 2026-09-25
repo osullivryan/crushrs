@@ -151,6 +151,40 @@ impl Pulse {
         Pulse { time, accel }
     }
 
+    /// Copy with the sign convention "forward = positive": if the record's
+    /// net velocity change is positive (the vehicle was travelling in −X
+    /// of the test's global frame) the signal is negated, so a crash
+    /// deceleration is always negative.
+    pub fn forward(&self) -> Pulse {
+        let dv: f64 = integrate(&self.time, &self.accel, 0.0).last().copied().unwrap_or(0.0);
+        if dv > 0.0 {
+            Pulse { time: self.time.clone(), accel: self.accel.iter().map(|a| -a).collect() }
+        } else {
+            self.clone()
+        }
+    }
+
+    /// Point-wise mean of several pulses (e.g. left and right sill), on the
+    /// first pulse's time grid.
+    pub fn average(pulses: &[Pulse]) -> Pulse {
+        let base = &pulses[0];
+        let mut accel = vec![0.0; base.time.len()];
+        for p in pulses {
+            let (_, y) = resample(&p.time, &p.accel, base.time[0], base.dt(), *base.time.last().unwrap());
+            for (a, b) in accel.iter_mut().zip(y) {
+                *a += b / pulses.len() as f64;
+            }
+        }
+        Pulse { time: base.time.clone(), accel }
+    }
+
+    /// Read one or more NHTSA TSV files (comma-separated list) and average
+    /// them, in the forward-positive convention.
+    pub fn read_nhtsa_list(list: &str, in_g: bool) -> Result<Self, String> {
+        let pulses: Vec<Pulse> = list.split(',').map(|f| Pulse::read_nhtsa_tsv(Path::new(f.trim()), in_g).map(|p| p.forward())).collect::<Result<_, _>>()?;
+        Ok(Pulse::average(&pulses))
+    }
+
     /// CFC-filtered copy.
     pub fn filtered(&self, cfc: f64) -> Pulse {
         Pulse { time: self.time.clone(), accel: cfc_filter(&self.accel, self.dt(), cfc) }

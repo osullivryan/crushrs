@@ -93,6 +93,29 @@ symmetric case is the barrier test: measured Δv 17.65 m/s), and 45 vs
 
 ![Neon vs Neon](docs/neon_pulse_headon.gif)
 
+### Blind validation: Navigator into Neon (NHTSA test 4429)
+
+`headon navigator neon-pulse 30.14 30.14 --mass-b 1378 --pulse-a
+data/nhtsa/v04429tsv.179,data/nhtsa/v04429tsv.182 --pulse-b
+data/nhtsa/v04429tsv.089,data/nhtsa/v04429tsv.092` predicts the real
+car-to-car test (2873 kg Navigator into the 1378 kg Neon, 30 mph each) from
+vehicles calibrated only on rigid-barrier tests — the Expedition/Navigator
+on test 3124 at the same speed, the Neon on test 2320 at a different speed.
+
+![validation](docs/navigator_neon_validation.png)
+
+Through the main pulse (0–80 ms) it holds: Navigator velocity within
+0.3 m/s and peak −14 vs −16 g; Neon peak −32 vs −33 g but ~8 ms early. The
+late phase (80–110 ms) is under-predicted and the collision ends too soon:
+Δv 8.1 vs 9.9 m/s (Navigator) and 16.8 vs 19.6 m/s (Neon) at 150 ms. Two
+reasons, both visible in the mesh: the Navigator's front outside the Neon's
+silhouette (40 % of its face) never engages, whereas the real Navigator's
+rails and engine sit inside it — a homogenised face spreads stiffness
+uniformly; and the Neon is crushed 864 mm here, beyond the 736 mm its
+barrier test calibrated. The next step for mismatched pairs is a structural
+core box per face (rails/engine) inside a soft skin, which the barrier
+calibration cannot distinguish but the load-cell wall (AHOF) data can.
+
 What a homogenised block cannot do: the real car decelerates the cabin
 within 3 ms through stiff rails while the engine mass is still free; the
 block needs ~10 ms for its plastic wave. And it stores less recoverable

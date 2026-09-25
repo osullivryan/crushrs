@@ -330,6 +330,46 @@ impl Vehicle {
         v
     }
 
+    /// 1999 Ford Expedition (body-on-frame full-size SUV; the Lincoln
+    /// Navigator is the same platform), for pulse calibration against NHTSA
+    /// test 3124 (flat rigid barrier at 48.5 km/h, 2460 kg, rear frame
+    /// crossmember X): a 1.7 m crush zone with 320 kg and a bumper.
+    pub fn ford_expedition_1999() -> Self {
+        let mut v = Vehicle::from_ncap("expedition", 2460.0, [5.2, 2.0, 1.9], 5.2, 2.5e6, crash3_ratio(86.36, 11.72), 0.12, 30.0 * 0.44704);
+        v.crush_zone_length = 1.7;
+        v.crush_element_size = Some(0.1);
+        v.crush_zone_mass = Some(320.0);
+        v.bumper = Some([0.1, 35.0, 3.0e8]);
+        v.modulus = 7.3e6;
+        v.body_modulus = 3.93e8;
+        // Fitted to test 3124 (`barrier expedition --pulse
+        // data/nhtsa/v03124tsv.031,data/nhtsa/v03124tsv.032 --mph 30.14
+        // --calibrate 8`): crush 677 vs 672 mm, e 0.118 vs 0.130, peak −21
+        // vs −28 g, CFC 60 RMS 3.5 g.
+        let knots = [0.0, 0.1064, 0.2128, 0.3192, 0.4256, 0.5320, 0.6384];
+        let force_kn = [29.0, 183.0, 259.0, 417.0, 457.0, 457.0, 457.0];
+        v.force_table = Some(knots.iter().zip(force_kn).map(|(x, f)| [*x, f * 1e3]).collect());
+        v
+    }
+
+    /// 1999 Lincoln Navigator as tested in NHTSA test 4429 (2873 kg):
+    /// the Expedition structure with the Navigator's mass and dimensions
+    /// (length 5.175 m, width 2.049 m).
+    pub fn lincoln_navigator_1999() -> Self {
+        let mut v = Vehicle::ford_expedition_1999();
+        v.name = "navigator".into();
+        v.mass = 2873.0;
+        v.size = [5.175, 2.049, 1.9];
+        v
+    }
+
+    /// Same vehicle with another test mass (structure unchanged: the extra
+    /// mass goes to the body block).
+    pub fn with_mass(mut self, mass: f64) -> Self {
+        self.mass = mass;
+        self
+    }
+
     /// KW400 = 2550 N/mm (NHTSA DOT HS 811 293), pickup-class CRASH3 A/B.
     pub fn chevrolet_silverado_2007() -> Self {
         Vehicle::from_ncap("silverado", 2622.0, [5.85, 2.03, 1.87], 5.85, 2.550e6, crash3_ratio(86.36, 11.72), 0.12, 35.0 * 0.44704)

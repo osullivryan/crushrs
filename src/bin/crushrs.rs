@@ -56,6 +56,9 @@ enum Cmd {
         /// Override the transverse cap factor of the crush material.
         #[arg(long)]
         transverse: Option<f64>,
+        /// Barrier impact speed (mph) for --pulse runs (default 35).
+        #[arg(long, default_value_t = 35.0)]
+        mph: f64,
         #[command(flatten)]
         out: Out,
     },
@@ -79,6 +82,18 @@ enum Cmd {
         /// Lateral offset of vehicle B (m): 0 = full overlap.
         #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
         offset: f64,
+        /// Measured rear-seat/sill X pulse(s) of vehicle A (NHTSA TSV, comma-separated to average).
+        #[arg(long)]
+        pulse_a: Option<String>,
+        /// Measured pulse(s) of vehicle B.
+        #[arg(long)]
+        pulse_b: Option<String>,
+        /// Test mass of vehicle A (kg) if different from the preset.
+        #[arg(long)]
+        mass_a: Option<f64>,
+        /// Test mass of vehicle B (kg).
+        #[arg(long)]
+        mass_b: Option<f64>,
         #[command(flatten)]
         out: Out,
     },
@@ -165,7 +180,9 @@ fn vehicle_by_name(name: &str) -> Vehicle {
         "neon" => Vehicle::dodge_neon_1996_tuned(),
         "neon-raw" => Vehicle::dodge_neon_1996(),
         "neon-pulse" => Vehicle::dodge_neon_1996_pulse(),
-        other => panic!("unknown vehicle '{}' (neon | neon-raw | neon-pulse | silverado | silverado-raw)", other),
+        "expedition" => Vehicle::ford_expedition_1999(),
+        "navigator" => Vehicle::lincoln_navigator_1999(),
+        other => panic!("unknown vehicle '{}' (neon | neon-raw | neon-pulse | silverado | silverado-raw | expedition | navigator)", other),
     }
 }
 
@@ -208,15 +225,9 @@ fn main() {
             }
             outputs(&model, &results, &out, None);
         }
-        Cmd::Barrier { vehicle, element_size, calibrate: cal, pulse, modulus, body_modulus, crush_zone, crush_mass, transverse, out } => {
+        Cmd::Barrier { vehicle, element_size, calibrate: cal, pulse, modulus, body_modulus, crush_zone, crush_mass, transverse, mph, out } => {
             if let Some(pulse_file) = pulse {
-                let mut v = match vehicle.as_str() {
-                    "silverado" => Vehicle::chevrolet_silverado_2007_tuned(),
-                    "silverado-raw" => Vehicle::chevrolet_silverado_2007(),
-                    "neon-raw" => Vehicle::dodge_neon_1996(),
-                    "neon-pulse" => Vehicle::dodge_neon_1996_pulse(),
-                    _ => Vehicle::dodge_neon_1996_tuned(),
-                };
+                let mut v = vehicle_by_name(&vehicle);
                 if let Some(e) = modulus {
                     v.modulus = e;
                 }
@@ -233,8 +244,8 @@ fn main() {
                 if let Some(t) = transverse {
                     v.transverse_factor = t;
                 }
-                let speed = 35.0 * MPH;
-                let measured = crushrs::signal::Pulse::read_nhtsa_tsv(Path::new(&pulse_file), true).unwrap_or_else(|e| panic!("{}", e));
+                let speed = mph * MPH;
+                let measured = crushrs::signal::Pulse::read_nhtsa_list(&pulse_file, true).unwrap_or_else(|e| panic!("{}", e));
                 println!("{}: {:.0} kg at {:.1} m/s vs measured pulse {} ({} samples at {:.0} kHz)", v.name, v.mass, speed, pulse_file, measured.time.len(), 1e-3 / measured.dt());
                 let v = match cal {
                     Some(n) => {
@@ -346,9 +357,15 @@ fn main() {
             println!("restitution e = {:.3};  momentum {:.0} -> {:.0} kg·m/s", (vc[0] - vt[0]) / (v_t0 - v_c0), mt * v_t0 + mc * v_c0, mt * vt[0] + mc * vc[0]);
             outputs(&model, &results, &out, None);
         }
-        Cmd::Headon { vehicle_a, vehicle_b, mph_a, mph_b, offset, out } => {
+        Cmd::Headon { vehicle_a, vehicle_b, mph_a, mph_b, offset, pulse_a, pulse_b, mass_a, mass_b, out } => {
             let mut a = vehicle_by_name(&vehicle_a);
             let mut b = vehicle_by_name(&vehicle_b);
+            if let Some(m) = mass_a {
+                a = a.with_mass(m);
+            }
+            if let Some(m) = mass_b {
+                b = b.with_mass(m);
+            }
             a.name = format!("{}_a", a.name);
             b.name = format!("{}_b", b.name);
             let h = Vehicle::TUNED_ELEMENT_SIZE;
@@ -378,6 +395,28 @@ fn main() {
             println!("{:<12} {:+7.2} m/s {:+6.1} mph   {:4.0} mm   {:6.1} g      ({:+.2} m/s)", a.name, dva[0], dva[0] / MPH, crush_rear(&model, &results, &acc_a, &fa) * 1e3, peak_g(&model, &results, &acc_a).unwrap_or(f64::NAN), v_common - v_a0);
             println!("{:<12} {:+7.2} m/s {:+6.1} mph   {:4.0} mm   {:6.1} g      ({:+.2} m/s)", b.name, dvb[0], dvb[0] / MPH, crush_rear(&model, &results, &acc_b, &fb) * 1e3, peak_g(&model, &results, &acc_b).unwrap_or(f64::NAN), v_common - v_b0);
             println!("restitution e = {:.3};  momentum {:.0} -> {:.0} kg·m/s", (vb[0] - va[0]) / (v_a0 - v_b0), ma * v_a0 + mb * v_b0, ma * va[0] + mb * vb[0]);
+            for (label, file, acc, speed, sign) in [("A", pulse_a, &acc_a, mph_a * MPH, 1.0), ("B", pulse_b, &acc_b, mph_b * MPH, -1.0)] {
+                let Some(file) = file else { continue };
+                let measured = crushrs::signal::Pulse::read_nhtsa_list(&file, true).unwrap_or_else(|e| panic!("{}", e)).filtered(60.0).resampled(PULSE_DT).truncated(PULSE_END);
+                let mut sim = crushrs::signal::Pulse::from_history(&model, &results, acc, PULSE_DT).unwrap();
+                // Vehicle B heads −X: express its pulse forward-positive.
+                sim.accel.iter_mut().for_each(|a| *a *= sign);
+                let sim = sim.filtered(60.0);
+                let mass = if label == "A" { ma } else { mb };
+                let cmp = PulseComparison::new(&measured, &sim, mass, speed);
+                println!("vehicle {} vs measured {}:", label, file);
+                println!("  t[ms]   a_meas   a_sim [g]    v_meas   v_sim [m/s]   x_meas   x_sim [mm]");
+                let step = (0.01 / PULSE_DT).round() as usize;
+                for i in (0..cmp.time.len()).step_by(step) {
+                    println!("  {:5.0}   {:6.1}   {:6.1}       {:6.2}   {:6.2}       {:6.0}   {:6.0}", cmp.time[i] * 1e3, cmp.a_meas[i] / 9.81, cmp.a_sim[i] / 9.81, cmp.v_meas[i], cmp.v_sim[i], cmp.x_meas[i] * 1e3, cmp.x_sim[i] * 1e3);
+                }
+                println!("  peak (CFC60) {:.1} / {:.1} g, max crush {:.0} / {:.0} mm at {:.0} / {:.0} ms, delta-v at {:.0} ms {:.2} / {:.2} m/s, rms {:.2} g  (measured / simulated)", cmp.meas.peak_accel / 9.81, cmp.sim.peak_accel / 9.81, cmp.meas.max_crush * 1e3, cmp.sim.max_crush * 1e3, cmp.meas.t_max_crush * 1e3, cmp.sim.t_max_crush * 1e3, cmp.time.last().unwrap() * 1e3, speed - cmp.v_meas.last().unwrap(), speed - cmp.v_sim.last().unwrap(), cmp.rms_accel_error() / 9.81);
+                if let Some(base) = &out.history {
+                    let path = format!("{}.pulse_{}.parquet", base, label.to_lowercase());
+                    cmp.write_parquet(Path::new(&path)).expect("write pulse");
+                    println!("  wrote {}", path);
+                }
+            }
             outputs(&model, &results, &out, None);
         }
         Cmd::Tbone { truck_mph, car_mph, offset, out } => {
