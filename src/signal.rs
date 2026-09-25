@@ -241,6 +241,36 @@ impl PulseMetrics {
         PulseMetrics { t_max_crush: p.time[i_max], max_crush, v_end, restitution: (-v_min / v0).max(0.0), peak_accel: p.accel.iter().copied().fold(0.0, f64::min), force_crush }
     }
 
+    /// Energy-equivalent stiffness over a crush window (N/m): NHTSA's
+    /// KW400 for `(0.025, 0.4)`, `2·(E(x1) − E(x0)) / (x1² − x0²)` with
+    /// `E` the energy absorbed up to a crush. `None` when the record does
+    /// not reach `x1`.
+    pub fn kw_window(&self, (x0, x1): (f64, f64)) -> Option<f64> {
+        if self.max_crush < x1 {
+            return None;
+        }
+        let energy_at = |d: f64| -> f64 {
+            let mut e = 0.0;
+            for w in self.force_crush.windows(2) {
+                let ([c0, f0], [c1, f1]) = (w[0], w[1]);
+                if c1 <= c0 {
+                    continue;
+                }
+                if c1 <= d {
+                    e += 0.5 * (f0 + f1) * (c1 - c0);
+                } else if c0 < d {
+                    let f_d = f0 + (f1 - f0) * (d - c0) / (c1 - c0);
+                    e += 0.5 * (f0 + f_d) * (d - c0);
+                    break;
+                } else {
+                    break;
+                }
+            }
+            e
+        };
+        Some(2.0 * (energy_at(x1) - energy_at(x0)) / (x1 * x1 - x0 * x0))
+    }
+
     /// Mean force over a crush window `[x0, x1]` of the loading phase.
     pub fn mean_force(&self, x0: f64, x1: f64) -> Option<f64> {
         let pts: Vec<&[f64; 2]> = self.force_crush.iter().filter(|p| p[0] >= x0 && p[0] <= x1).collect();

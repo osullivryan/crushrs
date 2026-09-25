@@ -1,0 +1,37 @@
+# 1996 Dodge Neon — everything `crushrs tune` needs, from NHTSA data.
+#   crushrs tune vehicles/specs/neon_1996.toml -o vehicles/neon_1996.toml
+name = "neon"
+mass = 1354.0                  # NCAP test weight (kg)
+size = [4.36, 1.71, 1.35]      # length, width, height (m)
+
+[frontal]                      # NCAP test 2320: 56.5 km/h rigid barrier, 1354 kg
+test = 2320
+speed_mph = 35.1
+curves = ["../../data/nhtsa/v02320tsv.078"]   # left rear seat X, NHTSA ASCII export (g)
+rounds = 8
+crush_zone_length = 1.5
+crush_element_size = 0.1
+crush_zone_mass = 190.0
+bumper = [0.1, 25.0, 3.0e8]
+modulus = 4.0e6
+body_modulus = 2.7e8
+
+[side]                         # FMVSS 214 MDB-test sedan coefficients (2013 Ford Fusion;
+a = 40.3e3                     # no Neon-specific side data is published): N/m of contact length
+b = 1.29e6                     # N/m²
+iterations = 8
+
+# [rear]                       # CRASH3 rear coefficients, kg/cm and kg/cm² — add when known;
+# a = ...                      # without them rear-end impacts with this vehicle refuse to run
+# b = ...
+
+[rail_box]                     # no load-cell wall data for this 1996 test: the box cross-checked
+width = 0.45                   # against NHTSA test 4429 (Navigator into Neon) with
+z_range = [0.06, 0.41]         # `headon navigator neon-pulse ... --calibrate-rail-boxes 12`
+force_fraction = 0.8
+# With a wall export, instead:
+# rows = 4
+# columns = 9
+# cell_size = [0.234, 0.246]
+# wall_bottom = 0.08
+# cells = ["../../data/nhtsa/vNNNNNtsv.101", "..."]   # 36 channels, row by row from the bottom

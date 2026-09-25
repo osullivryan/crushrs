@@ -8,7 +8,7 @@
 use clap::{Args, Parser, Subcommand};
 use crushrs::output::gif::{write_gif, GifOptions};
 use crushrs::headon::HeadOn;
-use crushrs::vehicle::{add_vehicle, add_vehicle_accelerometer, assign_vehicle, barrier_metrics_window, barrier_model, calibrate, calibrate_pulse, BarrierTargets, Heading, PulseComparison, Vehicle, PULSE_DT, PULSE_END};
+use crushrs::vehicle::{add_ground, add_ground_contact, add_vehicle, add_vehicle_accelerometer, assign_vehicle, barrier_metrics_window, barrier_model, calibrate, calibrate_pulse, BarrierTargets, Heading, PulseComparison, Vehicle, PULSE_DT, PULSE_END};
 use crushrs::{BlockFace, Mesh, Model, Results, MPH};
 use nalgebra::Vector3;
 use std::path::Path;
@@ -119,6 +119,25 @@ enum Cmd {
         #[command(flatten)]
         out: Out,
     },
+    /// Tune a vehicle end to end from a spec naming its dimensions and
+    /// NHTSA tests (see src/tune.rs for the format); writes a vehicle TOML.
+    Tune {
+        spec: String,
+        /// Output vehicle file (default `<name>.toml` next to the spec).
+        #[arg(short, long)]
+        out: Option<String>,
+        #[arg(long, default_value_t = Vehicle::TUNED_ELEMENT_SIZE)]
+        element_size: f64,
+    },
+    /// Write a built-in vehicle preset as a TOML file (the format `tune`
+    /// writes and every command reads in place of a preset name).
+    Vehicle {
+        /// Preset name.
+        vehicle: String,
+        /// Output file (default `<name>.toml`).
+        #[arg(short, long)]
+        out: Option<String>,
+    },
     /// T-bone: Silverado into the side of a Neon.
     Tbone {
         #[arg(default_value_t = 30.0)]
@@ -129,6 +148,33 @@ enum Cmd {
         /// Impact point along the Neon relative to its centre (+ toward its front).
         #[arg(default_value_t = 0.0, allow_hyphen_values = true)]
         offset: f64,
+        /// Ground clearance (m) of the road under both vehicles.
+        #[arg(long, default_value_t = Vehicle::GROUND_CLEARANCE)]
+        clearance: f64,
+        /// No road: the vehicles are free in space.
+        #[arg(long)]
+        no_ground: bool,
+        #[command(flatten)]
+        out: Out,
+    },
+    /// Rear-end: the front of A into the rear of B, both heading the same
+    /// way (B needs a rear curve: `[rear]` in its tune spec).
+    Rearend {
+        vehicle_a: String,
+        vehicle_b: String,
+        #[arg(default_value_t = 35.0)]
+        mph_a: f64,
+        #[arg(default_value_t = 0.0)]
+        mph_b: f64,
+        /// Lateral offset of vehicle B (m): 0 = full overlap.
+        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+        offset: f64,
+        #[arg(long, default_value_t = Vehicle::GROUND_CLEARANCE)]
+        clearance: f64,
+        #[arg(long)]
+        no_ground: bool,
+        #[arg(long, default_value_t = Vehicle::TUNED_ELEMENT_SIZE)]
+        element_size: f64,
         #[command(flatten)]
         out: Out,
     },
@@ -195,7 +241,12 @@ fn part_delta_v(model: &Model, results: &Results, part: &str) -> (f64, [f64; 3],
     (m, [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]], v1)
 }
 
+/// A built-in preset by name, or a vehicle TOML file (`*.toml`, e.g. one
+/// written by `tune` or `vehicle export`).
 fn vehicle_by_name(name: &str) -> Vehicle {
+    if name.ends_with(".toml") {
+        return Vehicle::load(Path::new(name)).unwrap_or_else(|e| panic!("{}", e));
+    }
     match name {
         "silverado" => Vehicle::chevrolet_silverado_2007_tuned(),
         "silverado-raw" => Vehicle::chevrolet_silverado_2007(),
@@ -204,7 +255,7 @@ fn vehicle_by_name(name: &str) -> Vehicle {
         "neon-pulse" => Vehicle::dodge_neon_1996_pulse(),
         "expedition" => Vehicle::ford_expedition_1999(),
         "navigator" => Vehicle::lincoln_navigator_1999(),
-        other => panic!("unknown vehicle '{}' (neon | neon-raw | neon-pulse | silverado | silverado-raw | expedition | navigator)", other),
+        other => panic!("unknown vehicle '{}' (neon | neon-raw | neon-pulse | silverado | silverado-raw | expedition | navigator, or a vehicle .toml)", other),
     }
 }
 
@@ -449,7 +500,54 @@ fn main() {
             }
             outputs(&model, &results, &out, None);
         }
-        Cmd::Tbone { truck_mph, car_mph, offset, out } => {
+        Cmd::Tune { spec, out, element_size } => {
+            let path = Path::new(&spec);
+            let spec = crushrs::tune::TuneSpec::load(path).unwrap_or_else(|e| panic!("{}", e));
+            let base = path.parent().unwrap_or(Path::new("."));
+            let (v, report) = crushrs::tune::tune(&spec, base, element_size, true).unwrap_or_else(|e| panic!("{}", e));
+            let out = out.unwrap_or_else(|| base.join(format!("{}.toml", v.name)).to_string_lossy().into_owned());
+            v.save(Path::new(&out)).unwrap_or_else(|e| panic!("{}", e));
+            println!("tuned {} at {:.2} m elements:", v.name, element_size);
+            for line in &report.lines {
+                println!("  {}", line);
+            }
+            println!("wrote {}", out);
+        }
+        Cmd::Vehicle { vehicle, out } => {
+            let v = vehicle_by_name(&vehicle);
+            let path = out.unwrap_or_else(|| format!("{}.toml", v.name));
+            v.save(Path::new(&path)).unwrap_or_else(|e| panic!("{}", e));
+            println!("wrote {}", path);
+        }
+        Cmd::Rearend { vehicle_a, vehicle_b, mph_a, mph_b, offset, clearance, no_ground, element_size, out } => {
+            let mut a = vehicle_by_name(&vehicle_a);
+            let struck = vehicle_by_name(&vehicle_b);
+            let mut b = struck.rear_profile().unwrap_or_else(|| panic!("{} has no rear curve: tune it with a [rear] section", struck.name));
+            a.name = format!("{}_a", a.name);
+            b.name = format!("{}_b", b.name);
+            // B's "front" is its rear, at x_min, and it heads +x: a negative
+            // speed for the −x-facing profile.
+            let mut setup = HeadOn::new(mph_a * MPH, -mph_b * MPH);
+            setup.offset = offset;
+            setup.clearance = if no_ground { None } else { Some(clearance) };
+            setup.element_size = element_size;
+            let (mut model, acc_a, acc_b) = setup.build(&a, &b);
+            let (fa, fb) = (format!("{}_front", a.name), format!("{}_front", b.name));
+            out.configure(&mut model);
+            let results = crushrs::run(&model);
+            let (ma, dva, va) = part_delta_v(&model, &results, &a.name);
+            let (mb, dvb, vb) = part_delta_v(&model, &results, &b.name);
+            let (v_a0, v_b0) = (mph_a * MPH, mph_b * MPH);
+            let v_common = (ma * v_a0 + mb * v_b0) / (ma + mb);
+            println!("rear-end: {} {:.0} kg @ {:.0} mph into the rear of {} {:.0} kg @ {:.0} mph", a.name, ma, mph_a, struck.name, mb, mph_b);
+            println!("{} elements, {} steps, {:.2?} (forces {:.2?}, contact {:.2?})", model.mesh.hexes.len(), results.steps, results.wall_time, results.force_time, results.contact_time);
+            println!("                 delta-v         crush   peak (CFC60)  (perfectly plastic limit)");
+            println!("{:<12} {:+7.2} m/s {:+6.1} mph   {:4.0} mm   {:6.1} g      ({:+.2} m/s)", a.name, dva[0], dva[0] / MPH, crush_rear(&model, &results, &acc_a, &fa) * 1e3, peak_g(&model, &results, &acc_a).unwrap_or(f64::NAN), v_common - v_a0);
+            println!("{:<12} {:+7.2} m/s {:+6.1} mph   {:4.0} mm   {:6.1} g      ({:+.2} m/s)", struck.name, dvb[0], dvb[0] / MPH, crush_rear(&model, &results, &acc_b, &fb) * 1e3, peak_g(&model, &results, &acc_b).unwrap_or(f64::NAN), v_common - v_b0);
+            println!("restitution e = {:.3};  momentum {:.0} -> {:.0} kg·m/s", (vb[0] - va[0]) / (v_a0 - v_b0), ma * v_a0 + mb * v_b0, ma * va[0] + mb * vb[0]);
+            outputs(&model, &results, &out, None);
+        }
+        Cmd::Tbone { truck_mph, car_mph, offset, clearance, no_ground, out } => {
             let truck = Vehicle::chevrolet_silverado_2007_tuned();
             let car = Vehicle::dodge_neon_1996_tuned();
             let side = car.side_profile();
@@ -458,11 +556,19 @@ fn main() {
             let mut mesh = Mesh::new();
             add_vehicle(&mut mesh, &truck, -gap, 0.0, 0.0, Heading::PlusX, h);
             let car_origin = [gap, -offset - side.size[1] / 2.0, 0.0];
-            mesh.add_hex_block(&side.name, car_origin, side.size, h, &[(BlockFace::XMin, "neon_side")]);
+            mesh.add_hex_block(&side.name, car_origin, side.size, h, &[(BlockFace::XMin, "neon_side"), (BlockFace::ZMin, "neon_side_bottom")]);
+            if !no_ground {
+                let w = side.size[1] + truck.size[1];
+                add_ground(&mut mesh, "ground", -clearance, [-truck.size[0] - 3.0, side.size[0] + 3.0], [-w, w], 0.3);
+            }
             let mut model = Model::new(mesh);
             assign_vehicle(&mut model, &truck, Heading::PlusX, truck_mph * MPH);
             model.set_material(&side.name, side.crush_material());
             model.set_initial_velocity(&side.name, [0.0, car_mph * MPH, 0.0]);
+            if !no_ground {
+                add_ground_contact(&mut model, &truck, "ground", clearance, h);
+                add_ground_contact(&mut model, &side, "ground", clearance, h);
+            }
             let n_face = model.mesh.face_set_nodes("neon_side").unwrap().len();
             model.add_contact_pair("silverado_front", "neon_side", side.contact_stiffness_per_node(n_face, h).min(truck.contact_stiffness_per_node(n_face, h)), 0.3);
             model.settings.end_time = 0.15;

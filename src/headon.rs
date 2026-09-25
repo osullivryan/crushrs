@@ -164,14 +164,21 @@ pub fn calibrate_rail_boxes(a: &Vehicle, b: &Vehicle, setup: &HeadOn, measured_a
         vb.rail_box = Some(rail_box_from_unit(&vb, &u[4..]));
         (va, vb)
     };
-    let evaluations = std::cell::Cell::new(0usize);
+    let evaluations = std::sync::atomic::AtomicUsize::new(0);
     let evaluate = |u: &[f64]| -> (f64, PulseComparison, PulseComparison) {
         let (va, vb) = with(u);
         let (_, _, pa, pb) = setup.run(&va, &vb);
         let ca = PulseComparison::new(&meas_a, &pa, ma, setup.speed_a);
         let cb = PulseComparison::new(&meas_b, &pb, mb, setup.speed_b);
-        evaluations.set(evaluations.get() + 1);
+        evaluations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         (pulse_objective(&ca) + pulse_objective(&cb), ca, cb)
+    };
+    // A generation's members are independent: evaluate them side by side
+    // (each run is itself parallel, so this pays on machines with more
+    // cores than one run can use).
+    let evaluate_all = |us: &[Vec<f64>]| -> Vec<(f64, PulseComparison, PulseComparison)> {
+        use rayon::prelude::*;
+        us.par_iter().map(|u| evaluate(u)).collect()
     };
     let describe = |u: &[f64]| -> String {
         let (va, vb) = with(u);
@@ -191,7 +198,7 @@ pub fn calibrate_rail_boxes(a: &Vehicle, b: &Vehicle, setup: &HeadOn, measured_a
     while pop.len() < np {
         pop.push((0..dims).map(|_| rng.uniform()).collect());
     }
-    let mut scored: Vec<(f64, PulseComparison, PulseComparison)> = pop.iter().map(|u| evaluate(u)).collect();
+    let mut scored = evaluate_all(&pop);
     let best_index = |s: &[(f64, PulseComparison, PulseComparison)]| s.iter().enumerate().min_by(|x, y| x.1 .0.partial_cmp(&y.1 .0).unwrap()).map(|(i, _)| i).unwrap();
     let mut best = best_index(&scored);
     if verbose {
@@ -199,27 +206,33 @@ pub fn calibrate_rail_boxes(a: &Vehicle, b: &Vehicle, setup: &HeadOn, measured_a
     }
     let (f_weight, cr) = (0.7, 0.9);
     for gen in 0..generations {
-        for i in 0..np {
-            let (r1, r2, r3) = loop {
-                let r = [rng.below(np), rng.below(np), rng.below(np)];
-                if r[0] != i && r[1] != i && r[2] != i && r[0] != r[1] && r[0] != r[2] && r[1] != r[2] {
-                    break (r[0], r[1], r[2]);
-                }
-            };
-            let j_rand = rng.below(dims);
-            let trial: Vec<f64> = (0..dims)
-                .map(|j| {
-                    if j == j_rand || rng.uniform() < cr {
-                        let v = pop[r1][j] + f_weight * (pop[r2][j] - pop[r3][j]);
-                        // Reflect into the unit cube.
-                        let v = if v < 0.0 { -v } else if v > 1.0 { 2.0 - v } else { v };
-                        v.clamp(0.0, 1.0)
-                    } else {
-                        pop[i][j]
+        // Synchronous DE: all trials of a generation come from the current
+        // population, then are evaluated together and selected.
+        let trials: Vec<Vec<f64>> = (0..np)
+            .map(|i| {
+                let (r1, r2, r3) = loop {
+                    let r = [rng.below(np), rng.below(np), rng.below(np)];
+                    if r[0] != i && r[1] != i && r[2] != i && r[0] != r[1] && r[0] != r[2] && r[1] != r[2] {
+                        break (r[0], r[1], r[2]);
                     }
-                })
-                .collect();
-            let s = evaluate(&trial);
+                };
+                let j_rand = rng.below(dims);
+                (0..dims)
+                    .map(|j| {
+                        if j == j_rand || rng.uniform() < cr {
+                            let v = pop[r1][j] + f_weight * (pop[r2][j] - pop[r3][j]);
+                            // Reflect into the unit cube.
+                            let v = if v < 0.0 { -v } else if v > 1.0 { 2.0 - v } else { v };
+                            v.clamp(0.0, 1.0)
+                        } else {
+                            pop[i][j]
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let results = evaluate_all(&trials);
+        for (i, (trial, s)) in trials.into_iter().zip(results).enumerate() {
             if s.0 <= scored[i].0 {
                 pop[i] = trial;
                 scored[i] = s;
@@ -228,10 +241,10 @@ pub fn calibrate_rail_boxes(a: &Vehicle, b: &Vehicle, setup: &HeadOn, measured_a
         best = best_index(&scored);
         if verbose {
             let mean = scored.iter().map(|s| s.0).sum::<f64>() / np as f64;
-            log::info!("rail-box calibrate: generation {} ({} runs): best J {:.3}, mean {:.3} — {}", gen, evaluations.get(), scored[best].0, mean, describe(&pop[best]));
+            log::info!("rail-box calibrate: generation {} ({} runs): best J {:.3}, mean {:.3} — {}", gen, evaluations.load(std::sync::atomic::Ordering::Relaxed), scored[best].0, mean, describe(&pop[best]));
         }
     }
     let (va, vb) = with(&pop[best]);
     let (objective, cmp_a, cmp_b) = scored.swap_remove(best);
-    RailBoxFit { a: va, b: vb, objective, cmp_a, cmp_b, evaluations: evaluations.get() }
+    RailBoxFit { a: va, b: vb, objective, cmp_a, cmp_b, evaluations: evaluations.load(std::sync::atomic::Ordering::Relaxed) }
 }

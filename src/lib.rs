@@ -17,6 +17,7 @@ pub mod model;
 pub mod output;
 pub mod signal;
 pub mod solver;
+pub mod tune;
 pub mod vehicle;
 
 pub use material::{Material, PlasticModel, Plasticity};

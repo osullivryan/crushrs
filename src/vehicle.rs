@@ -35,9 +35,10 @@ use crate::material::Material;
 use crate::mesh::{BlockFace, Mesh};
 use crate::model::Model;
 use crate::solver::Results;
+use serde::{Deserialize, Serialize};
 
 /// Bilinear frontal force–crush model `F = F_y + k·C` (N, N/m).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CrushCurve {
     pub yield_force: f64,
     pub stiffness: f64,
@@ -88,7 +89,7 @@ pub fn crash3_ratio(a_kg_per_cm: f64, b_kg_per_cm2: f64) -> f64 {
 /// against a flat rigid barrier: the barrier calibration is untouched. A
 /// partner that overlaps only part of the face (a narrower, lower car)
 /// sees the concentrated load instead of a uniformly spread one.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RailBox {
     /// Lateral extent of the rail box (m), centred on the vehicle.
     pub width: f64,
@@ -98,8 +99,11 @@ pub struct RailBox {
     pub force_fraction: f64,
 }
 
-/// A homogenised vehicle.
-#[derive(Clone, Debug)]
+/// A homogenised vehicle. Serialises to TOML (`Vehicle::save` /
+/// `Vehicle::load`), which is how a vehicle tuned by `crushrs tune` is
+/// kept and passed to the impact commands.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default = "Vehicle::blank")]
 pub struct Vehicle {
     pub name: String,
     /// Test mass (kg).
@@ -115,19 +119,31 @@ pub struct Vehicle {
     pub body_modulus: f64,
     /// Side force–crush curve (whole-side, per the full vehicle length), for
     /// T-bone / side impacts. `None` = use the frontal curve.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub side_curve: Option<CrushCurve>,
     /// Modulus of the side profile (Pa); `None` = `modulus`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub side_modulus: Option<f64>,
+    /// Rear force–crush curve (whole rear face), for rear-end impacts.
+    /// `None` = no rear structure known (rear impacts refuse to run).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rear_curve: Option<CrushCurve>,
+    /// Modulus of the rear profile (Pa); `None` = `modulus`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rear_modulus: Option<f64>,
     /// Tabulated frontal force–crush curve `[[crush m, force N], ...]`
     /// (from a measured pulse, see [`calibrate_pulse`]). When set it
     /// replaces `curve` for the crush material.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub force_table: Option<Vec<[f64; 2]>>,
     /// Element length along the crush direction inside the crush zone
     /// (`None` = the block element size). Only used when the crush zone is
     /// shorter than the vehicle.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub crush_element_size: Option<f64>,
     /// Compaction at each `force_table` knot (from [`calibrate_pulse`]);
     /// `None` = uniform crush of the crush zone, `c = −ln(1 − x/L_c)`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub compaction_map: Option<Vec<f64>>,
     /// Transverse cap factor of the crush material (see
     /// `Plasticity::transverse_factor`): sideways the front is this many
@@ -137,18 +153,77 @@ pub struct Vehicle {
     /// `[thickness m, mass kg, modulus Pa]` (part `<name>_bumper`): spreads
     /// nodal contact loads into the honeycomb like a bumper beam, so two
     /// soft fronts meet as two stiff faces. Only with a crush zone.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub bumper: Option<[f64; 3]>,
     /// Mass of the crush-zone material (kg); the rest of the vehicle mass
     /// sits in the body block. `None` = uniform density. A light crush
     /// zone carries the plastic wave faster (√(H/ρ)), like real rails
     /// ahead of the engine and cabin mass.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub crush_zone_mass: Option<f64>,
     /// Rail box (frame rails and engine) of the crush zone, see [`RailBox`];
     /// part `<name>_rails`. Only with a crush zone. `None` = uniform face.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rail_box: Option<RailBox>,
 }
 
 impl Vehicle {
+    /// An empty vehicle: the serde default for missing TOML fields.
+    fn blank() -> Self {
+        Vehicle {
+            name: String::new(),
+            mass: 0.0,
+            size: [0.0; 3],
+            crush_zone_length: 0.0,
+            curve: CrushCurve { yield_force: 0.0, stiffness: 0.0 },
+            modulus: 0.0,
+            body_modulus: 0.0,
+            side_curve: None,
+            side_modulus: None,
+            rear_curve: None,
+            rear_modulus: None,
+            force_table: None,
+            crush_element_size: None,
+            compaction_map: None,
+            crush_zone_mass: None,
+            bumper: None,
+            rail_box: None,
+            transverse_factor: Vehicle::TRANSVERSE_FACTOR,
+        }
+    }
+
+    /// A vehicle with only its name, mass and dimensions: the starting
+    /// point of `crushrs tune`, which fits everything else to the tests.
+    /// The bilinear `curve` is a placeholder until a pulse fit sets it
+    /// (from the fitted table's first knot and overall slope).
+    pub fn new(name: &str, mass: f64, size: [f64; 3]) -> Self {
+        let mut v = Vehicle::blank();
+        v.name = name.to_string();
+        v.mass = mass;
+        v.size = size;
+        v.crush_zone_length = size[0];
+        v.modulus = 20e6;
+        v.body_modulus = 20e6;
+        v
+    }
+
+    /// Read a vehicle from a TOML file written by [`Vehicle::save`] or
+    /// by `crushrs tune`.
+    pub fn load(path: &std::path::Path) -> Result<Self, String> {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {}", path.display(), e))?;
+        let v: Vehicle = toml::from_str(&text).map_err(|e| format!("{}: {}", path.display(), e))?;
+        if v.name.is_empty() || v.mass <= 0.0 || v.size.iter().any(|s| *s <= 0.0) || v.modulus <= 0.0 {
+            return Err(format!("{}: a vehicle needs name, mass, size and modulus", path.display()));
+        }
+        Ok(v)
+    }
+
+    /// Write the vehicle as TOML.
+    pub fn save(&self, path: &std::path::Path) -> Result<(), String> {
+        let text = toml::to_string(self).map_err(|e| e.to_string())?;
+        std::fs::write(path, text).map_err(|e| format!("{}: {}", path.display(), e))
+    }
+
     /// Build a vehicle from NCAP data. `restitution` sets the crush-zone
     /// modulus so the elastic energy at peak force is `e²` of the kinetic
     /// energy at `test_speed`.
@@ -178,7 +253,7 @@ impl Vehicle {
             modulus,
             body_modulus: modulus,
             side_curve: None,
-            side_modulus: None, force_table: None, crush_element_size: None, compaction_map: None, crush_zone_mass: None, bumper: None, rail_box: None, transverse_factor: Vehicle::TRANSVERSE_FACTOR,
+            side_modulus: None, rear_curve: None, rear_modulus: None, force_table: None, crush_element_size: None, compaction_map: None, crush_zone_mass: None, bumper: None, rail_box: None, transverse_factor: Vehicle::TRANSVERSE_FACTOR,
         }
     }
 
@@ -204,8 +279,40 @@ impl Vehicle {
             modulus: self.side_modulus.unwrap_or(self.modulus),
             body_modulus: self.side_modulus.unwrap_or(self.modulus),
             side_curve: None,
-            side_modulus: None, force_table: None, crush_element_size: None, compaction_map: None, crush_zone_mass: None, bumper: None, rail_box: None, transverse_factor: Vehicle::TRANSVERSE_FACTOR,
+            side_modulus: None, rear_curve: None, rear_modulus: None, force_table: None, crush_element_size: None, compaction_map: None, crush_zone_mass: None, bumper: None, rail_box: None, transverse_factor: Vehicle::TRANSVERSE_FACTOR,
         }
+    }
+
+    /// Set the rear curve from CRASH3-style rear coefficients `A` (N/m of
+    /// width) and `B` (N/m²): `F = w·(A + B·C)` over the full width.
+    pub fn with_rear_coefficients(mut self, a: f64, b: f64) -> Self {
+        self.rear_curve = Some(CrushCurve { yield_force: a * self.size[1], stiffness: b * self.size[1] });
+        self
+    }
+
+    /// The vehicle seen from behind: a uniform crushable block carrying the
+    /// rear curve, whose "front" face is the rear of the car. Calibrate and
+    /// impact it like a frontal profile; in a rear-end the struck vehicle is
+    /// this profile heading *away* (a negative speed in `headon::HeadOn`).
+    pub fn rear_profile(&self) -> Option<Vehicle> {
+        let curve = self.rear_curve?;
+        let mut v = self.clone();
+        v.name = format!("{}_rear", self.name);
+        v.crush_zone_length = self.size[0];
+        v.curve = curve;
+        v.modulus = self.rear_modulus.unwrap_or(self.modulus);
+        v.body_modulus = v.modulus;
+        v.side_curve = None;
+        v.side_modulus = None;
+        v.rear_curve = None;
+        v.rear_modulus = None;
+        v.force_table = None;
+        v.crush_element_size = None;
+        v.compaction_map = None;
+        v.crush_zone_mass = None;
+        v.bumper = None;
+        v.rail_box = None;
+        Some(v)
     }
 
     pub fn frontal_area(&self) -> f64 {
@@ -733,7 +840,8 @@ pub fn add_ground_contact(model: &mut Model, v: &Vehicle, ground: &str, clearanc
         return;
     }
     let bottom = format!("{}_bottom", v.name);
-    let n_face = model.mesh.face_set_nodes(&format!("{}_front", v.name)).map_or(1, |f| f.len());
+    let n_bottom = model.mesh.face_set_nodes(&bottom).map_or(1, |f| f.len());
+    let n_face = model.mesh.face_set_nodes(&format!("{}_front", v.name)).map_or(n_bottom, |f| f.len());
     model.set_material(ground, Material::elastic(1e9, 0.3, 1000.0)).fix(ground);
     model.add_contact_one_way(&bottom, &format!("{}_face", ground), v.contact_stiffness_per_node(n_face, element_size), clearance + 0.3);
 }
@@ -1028,9 +1136,11 @@ pub fn pulse_objective(cmp: &PulseComparison) -> f64 {
 /// the curve flattens; a flat plateau then localises into a lock-up front
 /// that works through the zone element by element at the plateau force).
 /// Then `rounds` of a pattern search on the log of each knot force, of
-/// the crush-zone modulus and of the body modulus minimise [`pulse_objective`], keeping the table
-/// non-decreasing from the second knot on (a softening segment would
-/// localise into a shock). About 16 barrier runs per round.
+/// the crush-zone modulus and of the body modulus minimise
+/// [`pulse_objective`], keeping the table non-decreasing from the second
+/// knot on (a softening segment would localise into a shock). The 18
+/// probes of a round run in parallel and the best is taken; the step
+/// halves when none improves.
 pub fn calibrate_pulse(v: &Vehicle, measured: &crate::signal::Pulse, speed: f64, element_size: f64, rounds: usize, verbose: bool) -> (Vehicle, PulseComparison) {
     use crate::signal::PulseMetrics;
     let meas = measured.filtered(60.0).resampled(PULSE_DT).truncated(PULSE_END);
@@ -1054,13 +1164,14 @@ pub fn calibrate_pulse(v: &Vehicle, measured: &crate::signal::Pulse, speed: f64,
         let (_, _, sim) = run_barrier_pulse(cand, element_size, speed, 0);
         PulseComparison::new(&meas, &sim, v.mass, speed)
     };
+    let objective = pulse_objective;
     let report = |tag: &str, cand: &Vehicle, cmp: &PulseComparison| {
         let sm = &cmp.sim;
         log::info!(
             "pulse calibrate {} {}: J {:.3}, peak {:.1}/{:.1} g, crush {:.0}/{:.0} mm at {:.0}/{:.0} ms, e {:.3}/{:.3}, rms Δa {:.2} g, v(end) err {:+.2} m/s, E {:.1} MPa, E_body {:.0} MPa, table kN {}",
             cand.name,
             tag,
-            pulse_objective(cmp),
+            objective(cmp),
             sm.peak_accel / 9.81,
             mm.peak_accel / 9.81,
             sm.max_crush * 1e3,
@@ -1078,42 +1189,58 @@ pub fn calibrate_pulse(v: &Vehicle, measured: &crate::signal::Pulse, speed: f64,
     };
 
     let mut best_cmp = evaluate(&tuned);
-    let mut best_j = pulse_objective(&best_cmp);
+    let mut best_j = objective(&best_cmp);
     if verbose {
         report("start", &tuned, &best_cmp);
     }
     let mut step = 0.3_f64; // in ln(force) / ln(E)
+    // Candidate `param` moved by `factor`, or None when the move is a no-op.
+    let candidate = |base: &Vehicle, param: usize, factor: f64| -> Option<Vehicle> {
+        let mut cand = base.clone();
+        if param < n_knots {
+            let t = cand.force_table.as_mut().unwrap();
+            t[param][1] *= factor;
+            for i in 2..t.len() {
+                t[i][1] = t[i][1].max(t[i - 1][1]);
+            }
+            if t == base.force_table.as_ref().unwrap() {
+                return None;
+            }
+        } else if param == n_knots {
+            cand.modulus = (cand.modulus * factor).clamp(2e6, 500e6);
+        } else {
+            cand.body_modulus = (cand.body_modulus * factor).clamp(2e7, 5e9);
+        }
+        Some(cand)
+    };
     for round in 0..rounds {
-        let mut improved = false;
+        // Every probe of the round (each parameter up and down) is
+        // independent: run them side by side and take the best.
+        let mut probes: Vec<(usize, f64, Vehicle)> = Vec::new();
         for param in 0..=n_knots + 1 {
             for dir in [1.0, -1.0] {
-                let mut cand = tuned.clone();
-                let factor = (dir * step).exp();
-                if param < n_knots {
-                    let t = cand.force_table.as_mut().unwrap();
-                    t[param][1] *= factor;
-                    for i in 2..t.len() {
-                        t[i][1] = t[i][1].max(t[i - 1][1]);
-                    }
-                    if t == tuned.force_table.as_ref().unwrap() {
-                        continue;
-                    }
-                } else if param == n_knots {
-                    cand.modulus = (cand.modulus * factor).clamp(2e6, 500e6);
-                } else {
-                    cand.body_modulus = (cand.body_modulus * factor).clamp(2e7, 5e9);
+                if let Some(c) = candidate(&tuned, param, (dir * step).exp()) {
+                    probes.push((param, dir, c));
                 }
-                let cmp = evaluate(&cand);
-                let j = pulse_objective(&cmp);
-                if j < best_j {
-                    best_j = j;
-                    tuned = cand;
-                    best_cmp = cmp;
-                    improved = true;
-                    if verbose {
-                        report(&format!("round {} p{}{}", round, param, if dir > 0.0 { "+" } else { "-" }), &tuned, &best_cmp);
-                    }
-                    break;
+            }
+        }
+        let scored: Vec<(f64, PulseComparison)> = {
+            use rayon::prelude::*;
+            probes.par_iter().map(|(_, _, c)| {
+                let cmp = evaluate(c);
+                (objective(&cmp), cmp)
+            }).collect()
+        };
+        let mut improved = false;
+        if let Some((i, (j, _))) = scored.iter().enumerate().min_by(|a, b| a.1 .0.partial_cmp(&b.1 .0).unwrap()) {
+            if *j < best_j {
+                let (param, dir, cand) = &probes[i];
+                best_j = *j;
+                tuned = cand.clone();
+                best_cmp = scored[i].1.clone();
+                improved = true;
+                if verbose {
+                    report(&format!("round {} p{}{}", round, param, if *dir > 0.0 { "+" } else { "-" }), &tuned, &best_cmp);
                 }
             }
         }

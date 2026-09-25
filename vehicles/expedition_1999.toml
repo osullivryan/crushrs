@@ -1,0 +1,20 @@
+name = "expedition"
+mass = 2460.0
+size = [5.2, 2.0, 1.9]
+crush_zone_length = 1.7
+modulus = 7300000.0
+body_modulus = 393000000.0
+force_table = [[0.0, 29000.0], [0.1064, 183000.0], [0.2128, 259000.0], [0.3192, 417000.0], [0.4256, 457000.0], [0.532, 457000.0], [0.6384, 457000.0]]
+crush_element_size = 0.1
+transverse_factor = 4.0
+bumper = [0.1, 35.0, 300000000.0]
+crush_zone_mass = 320.0
+
+[curve]
+yield_force = 136784.0851495185
+stiffness = 1856310.1875316778
+
+[rail_box]
+width = 1.25
+z_range = [0.15, 0.72]
+force_fraction = 0.75

@@ -1,0 +1,11 @@
+name = "silverado"
+mass = 2622.0
+size = [5.85, 2.03, 1.87]
+crush_zone_length = 5.85
+modulus = 27800000.0
+body_modulus = 27800000.0
+transverse_factor = 4.0
+
+[curve]
+yield_force = 51210.0
+stiffness = 559200.0

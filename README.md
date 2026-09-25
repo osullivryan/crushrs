@@ -21,8 +21,13 @@ cargo run --release -- headon navigator neon-pulse 30.14 30.14 --mass-b 1378 \
     --pulse-b data/nhtsa/v04429tsv.089,data/nhtsa/v04429tsv.092 [--calibrate-rail-boxes 12]   # vs a measured car-to-car test
 cargo run --release -- barrier neon                         # NCAP barrier test vs NHTSA KW400 targets
 cargo run --release -- barrier neon-pulse --pulse data/nhtsa/v02320tsv.078   # vs the measured NCAP pulse
+cargo run --release -- rearend silverado vehicles/neon_1996.toml 35 0   # A's front into B's rear (B needs a rear curve)
+cargo run --release -- tune vehicles/specs/neon_1996.toml -o vehicles/neon_1996.toml   # NHTSA test channels -> tuned vehicle TOML
 cargo run --release -- run examples/crash_impact.toml       # any TOML setup (writes out/crash.*.parquet)
 ```
+
+Anywhere a command takes a vehicle name it also takes a vehicle `.toml`
+(`vehicles/*.toml`, written by `tune` or by `vehicle <preset>`).
 
 ```
 2007 Silverado 2622 kg @ +30 mph  vs  1996 Neon 1354 kg @ -30 mph
@@ -80,7 +85,58 @@ Neon        +18.81 m/s  +42.1 mph   1093 mm   (+17.69 m/s)
 | 2007 Chevrolet Silverado | 2622 kg | 2550 N/mm | 2561 N/mm | 542 / 513 mm |
 
 Side impacts use `Vehicle::side_profile()` (the block turned 90° with a side
-crush curve from FMVSS 214 barrier-test coefficients).
+crush curve from FMVSS 214 barrier-test coefficients); rear-ends use
+`Vehicle::rear_profile()` the same way (`rearend a b mph_a mph_b`: A's front
+into B's rear, both heading the same way, on the road). `tbone` runs on the
+road too; for the Silverado into the Neon's side it changes nothing (the
+truck's face sits inside the car's long side, so no tilting moment
+develops), unlike the frontal case.
+
+### Tuning a vehicle from its NHTSA tests
+
+`tune` runs every calibration from one spec that names the vehicle's
+dimensions and its NHTSA test channels (`vehicles/specs/neon_1996.toml`;
+format in `src/tune.rs`), and writes a vehicle TOML the impact commands
+load by path. Nothing in it needs a second vehicle or a published summary
+number — it fits the test signals:
+
+1. **Frontal** — the rear-seat (or sill) X channel(s) of the NCAP
+   rigid-barrier test: `calibrate_pulse` builds a crush zone + body with a
+   7-knot force–crush table and fits it to the measured velocity history
+   (pattern search, 18 barrier runs per round in parallel).
+2. **Side** — FMVSS 214 MDB-test coefficients set the side curve and the
+   block turned 90° is calibrated to it (`side_profile`).
+3. **Rear** — CRASH3 rear coefficients (`[rear] a, b` in kg/cm, kg/cm²)
+   set the rear curve, calibrated the same way (`rear_profile`). No sourced
+   rear coefficients are in the repo yet; without them `rearend` refuses.
+4. **Rail box** — where the force goes on the face, from the frontal
+   test's **load-cell wall** when it has one (one channel per cell; the box
+   is the central span that holds 80 % of the force laterally and
+   vertically), else from a published average height of force, else given
+   explicitly.
+
+For the Neon that is two minutes on two cores:
+
+```
+frontal pulse (test 2320): peak -31.0 vs -35.2 g, crush 758 vs 740 mm at 76 vs 78 ms, e 0.135 vs 0.163, rms 5.88 g, Δv 17.67 vs 17.65 m/s
+side: KW150 8302 vs 7632 N/mm, crush 241 vs 282 mm, e 0.135
+rail box as given: 0.45 m wide, z 0.06–0.41 m, 80 % of the force
+```
+
+and the result predicts the car-to-car test below as well as the hand-built
+preset (Δv 9.65 / 19.71 vs measured 9.89 / 19.57 m/s). `vehicles/` holds the
+tuned files and `vehicles/specs/` the specs. Side and rear are the two
+stages still driven by coefficients rather than channels; with the side
+MDB and FMVSS 301 rear test pulses they become pulse fits like the frontal.
+
+On KW400: NHTSA's published stiffness is the wall force integrated over
+25–400 mm of crush, and it is about twice what the rear-seat channel
+integrates to over the same crush (575 vs 1251 N/mm for the Neon) — the
+cabin does not feel the front's force until the plastic wave arrives. The
+pipeline fits the channel, not the number; a vehicle with load-cell wall
+channels can be fitted to the wall force directly, which is the next stage
+to add. NHTSA's servers are not reachable from the build sandbox, so the
+spec names channel files you have exported.
 
 ### Calibrating to a measured pulse
 
