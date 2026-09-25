@@ -1,0 +1,5 @@
+/target
+/out
+*.gif
+*.vtu
+*.pvd

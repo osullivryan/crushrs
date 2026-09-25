@@ -1,0 +1,58 @@
+# Head-on 2007 Chevrolet Silverado vs 1996 Dodge Neon at 30 mph each.
+#   deltav run examples/crash_impact.toml --gif crash.gif --vtk out/crash
+#
+# Each vehicle is a homogenised crushable honeycomb block (density = NHTSA test
+# mass / block volume), calibrated so a simulated 35 mph NCAP rigid-barrier
+# test matches the measured KW400 stiffness and implied dynamic crush
+# (see src/vehicle.rs; parameters valid for 0.3 m elements).
+
+[[mesh.block]]
+part = "silverado"
+origin = [-5.855, -1.015, 0.0]
+size = [5.85, 2.03, 1.87]
+element_size = 0.3
+faces = [{ face = "x_max", set = "silverado_front" }]
+
+[[mesh.block]]
+part = "neon"
+origin = [0.005, -0.855, 0.0]
+size = [4.36, 1.71, 1.35]
+element_size = 0.3
+faces = [{ face = "x_min", set = "neon_front" }]
+
+# 2007 Silverado: 2622 kg. NHTSA KW400 = 2550 N/mm.
+[[material]]
+part = "silverado"
+youngs_modulus = 27.8e6
+density = 118.06
+yield_stress = 13490.0
+hardening = 861711.0
+model = "honeycomb"
+
+# 1996 Neon: 1354 kg. NHTSA KW400 = 1251 N/mm.
+[[material]]
+part = "neon"
+youngs_modulus = 23.1e6
+density = 134.53
+yield_stress = 7248.0
+hardening = 553354.0
+model = "honeycomb"
+
+[[initial_velocity]]
+set = "silverado"
+velocity = [13.4112, 0.0, 0.0]
+
+[[initial_velocity]]
+set = "neon"
+velocity = [-13.4112, 0.0, 0.0]
+
+# Two-way node-to-face penalty contact; stiffness is per contacting node (N/m).
+[[contact]]
+a = "silverado_front"
+b = "neon_front"
+stiffness = 2.2e6
+max_distance = 0.3
+
+[solver]
+end_time = 0.15        # s; the time step adapts to crushing elements
+frame_steps = 15       # capture a frame every 15 steps for GIF / VTK
